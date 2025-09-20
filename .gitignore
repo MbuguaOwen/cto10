@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Data & outputs
+inputs/
+!inputs/bars_1m/
+!inputs/ticks/
+outputs/
+
+# OS
+.DS_Store
+Thumbs.db

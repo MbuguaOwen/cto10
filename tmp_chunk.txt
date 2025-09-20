@@ -1,0 +1,80 @@
+        if len(train_slice):
+
+
+            f_atr, f_dcw = fit_percentiles(train_slice)
+
+
+            feat_all = apply_percentiles(feat_all, f_atr, f_dcw)
+
+
+    elif fit_on == "all":
+
+
+        if len(feat_all):
+
+
+            f_atr, f_dcw = fit_percentiles(feat_all)
+
+
+            feat_all = apply_percentiles(feat_all, f_atr, f_dcw)
+
+    # Add non-linear features after base + percentiles
+    feat_all = add_nonlinear_features(feat_all, cfg)
+
+
+    feat_all = add_age_features(feat_all, cfg, train_months, fold_dir)
+
+    cands = build_candidates_router(feat_all, cfg)
+
+
+    cands = cands.sort_values("ts").reset_index(drop=True)
+
+
+    cands.to_parquet(cpath, index=False)
+
+
+    _log(f"[{sym}] features: candidates={len(cands)}")
+
+
+def stage_tick_labeling(sym: str, train_months: List[str], test_months: List[str], cfg: Dict[str, Any], fold_dir: Path, force: bool) -> None:
+
+
+    _log(f"[{sym}] tick_labeling: start")
+
+
+    epath = fold_dir / "events.parquet"
+
+
+    if skip_if_exists(epath, force):
+
+
+        _log(f"[{sym}] SKIP tick_labeling (exists)")
+
+
+        return
+
+
+    cands = pd.read_parquet(fold_dir / "candidates.parquet")
+
+
+    if cands.empty:
+
+
+        pd.DataFrame(columns=["ts", "side", "entry", "level", "risk_dist", "outcome"]).to_parquet(epath, index=False)
+
+
+        _log(f"[{sym}] events: 0 (no candidates)")
+
+
+        return
+
+
+    cands = cands.sort_values("ts").reset_index(drop=True)
+
+
+    _log(f"[{sym}] tick_labeling: candidates={len(cands)}")
+
+
+    months_all = list(dict.fromkeys(train_months + test_months))
+
+

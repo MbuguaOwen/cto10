@@ -1,0 +1,150 @@
+io:
+  outputs_root: outputs
+  progress: true
+
+data:
+  symbols: [BTCUSDT]
+  bars_dir: inputs/bars_1m
+  ticks_dir: inputs/ticks
+  bar_schema: auto
+  file_patterns:
+    bars: "{SYMBOL}/{SYMBOL}-1m-{YYYY}-{MM}.csv"
+    ticks: "{SYMBOL}/{SYMBOL}-ticks-{YYYY}-{MM}.csv"   # auto-detect parquet too
+  months: { start: "2025-01", end: "2025-08" }
+
+walkforward:
+  train_months: 3
+  test_months: 1
+  step_months: 1
+
+features:
+  atr_n: 14
+  donch_n_candidate: 20
+  percentiles_fit_on: train
+
+  # Age/persistence (applies to base AND non-linear features we mark)
+  age:
+    enabled: true
+    n_bins_feature: 5          # TRAIN-fit quantiles
+    n_bins_age: 6              # TRAIN-fit on age
+    occ_windows: [60, 240]
+    log_age_bins: false
+    save_schema: true
+    schema_file: "artifacts/quantiles.json"
+
+  # Which base columns are fed into age/binning (must exist)
+  base_features:
+    - t_240; t_60; t_15; accel_15_240
+    - atr; dcw; atr_p; dcw_p
+    - body_dom; close_to_hi_atr; close_to_lo_atr
+
+  # Non-linear features (all computed from history up to t)
+  nonlinear:
+    enabled: true
+    windows: { small: 15, mid: 60 }   # integer minutes; used below
+    # Use TRAIN-fit quantiles; no fixed thresholds. τ in code is only a tiny numeric epsilon clamp.
+    include:
+      # A) Trend shape
+      - convexity_15_60_240
+      - trend_agree_15_60
+      - trend_agree_60_240
+      - trend_ratio_15_60
+      # B) Compression→release
+      - squeeze_score
+      - squeeze_pressure
+      - release_slope_15
+      # C) Location×impulse
+      - pin_high
+      - pin_low
+      - impulse_near_high
+      - impulse_near_low
+      - pos_01
+      # D) Choppiness
+      - zcr_60
+      - sign_entropy_60
+      - dc_count_60
+      # E) Vol structure
+      - rv60_over_atr
+      - range_ratio_60
+      - volofvol_proxy
+    # Apply age/occ/since to these as well (quantiles on TRAIN):
+    age_for_nonlinear: true
+
+candidates:
+  mode: blind
+  blind:
+    thinning:
+      type: cusum_by_ret
+      params: { ret_lookback: 240, k_sigma: 0.75, drift: 0.0, min_gap_bars: 10, fallback_stride_k: 10 }
+    sides: both
+
+labels:
+  r_mult: 5
+  horizon_hours: 72
+  quick_ignition_hours: 2
+  non_overlap: true
+  eta_atr: 0.30
+  eta_by_atr_p: []        # optional TRAIN regime map (kept empty by default)
+  eta_cap: { min: 0.10, max: 5.00 }
+  stop_band_atr: 0.05
+  consec_ticks: 2
+  dwell_ms: 50
+  time_scale_from_eta: { base_eta: 0.30, clamp: [0.5, 10.0] }
+
+mining:
+  rules:
+    auto_binning: true
+    n_bins_cont: 5
+    min_support_frac: 0.002
+    min_months: 2
+    metric: precision_lcb
+    wilson_z: 1.96
+    max_terms: 2
+    top_k: 12
+    precision_include_timeouts: false
+    # NEW: data-relative strictness
+    min_precision_uplift_pp: 8        # require LCB >= baseline_precision + 8 percentage points
+    min_resolve_uplift_pp: 10         # require resolve_frac >= baseline_resolve + 10 pp
+    max_timeout_rate: 0.50            # drop motifs with timeout share > 50% of its own matches
+    min_resolve_frac: 0.30            # and require at least 30% of matches to resolve
+    # Optional absolute floors (set to null to disable)
+    min_precision_lcb: 0.58           # e.g., 0.58 if you want an absolute floor
+    min_expR_lcb: null                # optional LCB on expected-R if you implement it
+    # Loser mining (blocklist)
+    mine_losers: true
+    loser_top_k: 8                    # keep a small set of stable losers
+    loser_max_precision_ucb: 0.35     # only consider rules whose UCB ≤ 35%
+    loser_min_resolve_frac: 0.40
+    loser_min_months: 2
+
+ml_gating:
+  enabled: true
+  model: logreg            # logreg | gbdt
+  target_ppv: 0.70         # precision target (validated via Wilson LCB)
+  min_coverage_frac: 0.02  # fallback coverage if target_ppv impossible
+  c_grid: [0.05, 0.1, 0.2, 0.5, 1.0]
+  gbdt_grid:
+    n_estimators: [100, 200]
+    max_depth: [2, 3]
+    learning_rate: [0.05, 0.1]
+    subsample: [0.7, 1.0]
+  class_weight: "balanced"
+  n_bins_cont: 5
+  features:
+    include_prefixes: ["qbin_", "qbin_agebin_", "since_", "occ_"]
+    exclude_prefixes: []
+  use_motif_crosses: true
+  combine_with_motifs: "ml_only"  # and | or | ml_only | motifs_only
+  regime_gate: true
+  regime_min_age_bin: 4
+  regime_occ_windows: [240]
+
+execution_sim:
+  use_rules: true
+  use_blocklist: false
+  min_winner_votes: 2        # k-of-n voting for motifs
+  min_rule_precision_lcb: 0.0  # optional pruning of winners
+  min_rule_support: 0          # optional pruning of winners
+  scheduler:
+    enabled: true
+    weight: "expR"           # expR | pwin
