@@ -291,13 +291,13 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
             "wins": int(wins),
             "losses": int(losses),
             "timeouts": int(tos),
+            "resolve_frac": float(resolve_frac),
+            "timeout_rate": float(timeout_rate),
             "precision": float(p_hat),
             "precision_lcb": float(p_lcb),
             "precision_ucb": float(p_ucb),
             "lift": float(lift),
             "lift_lcb": float(lift_lcb),
-            "resolve_frac": float(resolve_frac),
-            "timeout_rate": float(timeout_rate),
             "months_with_lift": int(months_with_lift),
             "unique_months": int(unique_months),
         }
@@ -417,21 +417,26 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
     lift_threshold = max(uplift_mul, 0.0)
     # Data-relative uplifts in percentage points
     prec_pp = base_p + (min_precision_uplift_pp / 100.0)
-    res_pp = base_resolve + (min_resolve_uplift_pp / 100.0)
 
-    promoted = stats.copy()
-    promoted = promoted[(promoted["precision_lcb"] >= max(prec_threshold, prec_pp)) & (promoted["lift_lcb"] >= lift_threshold)]
-    # Resolve requirements: both absolute floor and uplift over baseline
-    promoted = promoted[promoted["resolve_frac"] >= res_pp]
-    if min_resolve_frac is not None:
-        promoted = promoted[promoted["resolve_frac"] >= float(min_resolve_frac)]
+    rules_df = stats.copy()
+    keep = (rules_df["precision_lcb"] >= max(prec_threshold, prec_pp)) & (
+        rules_df["lift_lcb"] >= lift_threshold
+    )
+
+    baseline_resolve = base_resolve
+    uplift_pp = float(min_resolve_uplift_pp)
+    min_resolve_floor = float(min_resolve_frac) if min_resolve_frac is not None else 0.0
+    required_resolve = min(baseline_resolve + uplift_pp / 100.0, 0.98)
+    keep &= rules_df["resolve_frac"] >= np.maximum(required_resolve, min_resolve_floor)
+
     if max_timeout_rate is not None:
-        promoted = promoted[promoted["timeout_rate"] <= float(max_timeout_rate)]
+        keep &= rules_df["timeout_rate"] <= float(max_timeout_rate)
     if abs_min_plcb is not None:
-        promoted = promoted[promoted["precision_lcb"] >= float(abs_min_plcb)]
+        keep &= rules_df["precision_lcb"] >= float(abs_min_plcb)
     if min_wins > 0:
-        promoted = promoted[promoted["wins"] >= min_wins]
-    promoted = promoted.head(top_k).reset_index(drop=True)
+        keep &= rules_df["wins"] >= min_wins
+
+    promoted = rules_df[keep].head(top_k).reset_index(drop=True)
 
     promoted_ids = promoted["rule_id"].tolist()
     promoted_full = [rule_payload[rid] for rid in promoted_ids if rid in rule_payload]

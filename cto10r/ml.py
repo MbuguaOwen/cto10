@@ -1,4 +1,5 @@
 import json, math
+import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -178,6 +179,15 @@ def _choose_bins_for_feature(
                 if 0 < rm < len(edges) - 1:
                     edges = np.delete(edges, rm)
                     changed = True
+
+        if len(edges) < 4:
+            edges = np.quantile(x_fit.dropna(), [0, 1 / 3, 2 / 3, 1.0], method="linear")
+            edges = np.asarray(edges, dtype=float)
+            edges[0] = -np.inf
+            edges[-1] = np.inf
+            for i in range(1, len(edges)):
+                if edges[i] <= edges[i - 1]:
+                    edges[i] = edges[i - 1] + 1e-9
 
         idx_fit = np.clip(np.digitize(x_fit, edges, right=False) - 1, 0, len(edges) - 2)
         idx_val = np.clip(np.digitize(x_val, edges, right=False) - 1, 0, len(edges) - 2)
@@ -433,6 +443,40 @@ def build_feature_matrix(df: pd.DataFrame, cfg: dict, is_train: bool, bin_schema
     return Xc, None, bin_schema, Xc.columns.tolist()
 
 
+def _align_input_columns(Xc: pd.DataFrame, expected_cols: List[str]) -> pd.DataFrame:
+    expected = list(expected_cols or [])
+    aligned = Xc.copy()
+    if not expected:
+        return aligned.reindex(columns=expected)
+
+    n = len(aligned.index)
+    for col in expected:
+        if col not in aligned.columns:
+            fill = pd.Categorical(np.full(n, -1, dtype=int), categories=[-1])
+            aligned[col] = pd.Series(fill, index=aligned.index)
+        else:
+            series = aligned[col]
+            if pd.api.types.is_categorical_dtype(series):
+                if -1 not in series.cat.categories:
+                    series = series.cat.add_categories([-1])
+                series = series.fillna(-1)
+                aligned[col] = series.astype("category")
+            else:
+                vals = pd.to_numeric(series, errors="coerce").fillna(-1).astype(
+                    np.int64, copy=False
+                )
+                vals_np = vals.to_numpy(dtype=np.int64, copy=False)
+                cats = np.unique(np.append(vals_np, -1))
+                aligned[col] = pd.Series(
+                    pd.Categorical(vals_np, categories=cats), index=aligned.index
+                )
+
+    extras = [c for c in aligned.columns if c not in expected]
+    if extras:
+        aligned = aligned.drop(columns=extras)
+    return aligned.reindex(columns=expected)
+
+
 def _parse_winner_conds_for_crosses(conds: list[dict], df_cat_cols: list[str]):
     pairs = []
     simple = []
@@ -509,6 +553,9 @@ def train_ml_gating(cands_tr: pd.DataFrame, events_tr: pd.DataFrame, train_month
     if not ml_cfg.get("enabled", True):
         return None
 
+    art_dir = Path(out_dir) / "artifacts"
+    art_dir.mkdir(parents=True, exist_ok=True)
+
     y = events_tr[["ts","outcome"]].copy()
     # exclude timeouts: keep only resolved outcomes
     y = y[y["outcome"].isin(["win","loss"])].copy()
@@ -551,15 +598,15 @@ def train_ml_gating(cands_tr: pd.DataFrame, events_tr: pd.DataFrame, train_month
             bin_schema["cont"][c] = edges.tolist()
 
     X_fit_skel, enc, bin_schema, cols = build_feature_matrix(df_fit, ml_cfg, is_train=True, bin_schema=bin_schema)
+    with open(art_dir / "ml_input_cols.json", "w", encoding="utf-8") as f:
+        json.dump(list(cols), f, ensure_ascii=False, indent=2)
     X_fit_cat, _, _, _ = build_feature_matrix(df_fit, ml_cfg, is_train=False, bin_schema=bin_schema)
     X_val_cat, _, _, _ = build_feature_matrix(df_val, ml_cfg, is_train=False, bin_schema=bin_schema)
-    if cols:
-        missing_val_cols = [c for c in cols if c not in X_val_cat.columns]
-        for c in missing_val_cols:
-            fill = pd.Categorical(np.zeros(len(X_val_cat), dtype=int), categories=[0])
-            X_val_cat[c] = pd.Series(fill, index=X_val_cat.index)
-        X_val_cat = X_val_cat[cols]
-        X_fit_cat = X_fit_cat[cols]
+    expected_inputs = list(getattr(enc, "feature_names_in_", []))
+    if not expected_inputs:
+        expected_inputs = list(cols)
+    X_fit_cat = _align_input_columns(X_fit_cat, expected_inputs)
+    X_val_cat = _align_input_columns(X_val_cat, expected_inputs)
     X_val_base = enc.transform(X_val_cat)
 
     cross_cfg = ml_cfg.get("crosses", {})
@@ -571,7 +618,7 @@ def train_ml_gating(cands_tr: pd.DataFrame, events_tr: pd.DataFrame, train_month
     df_train_cross = pd.DataFrame(index=df_fit.index)
     df_val_cross = pd.DataFrame(index=df_val.index)
     cross_sources: Dict[str, str] = {}
-    gating_path = Path(out_dir) / "artifacts" / "gating.json"
+    gating_path = art_dir / "gating.json"
 
     motif_total = 0
     curated_total = 0
@@ -600,9 +647,9 @@ def train_ml_gating(cands_tr: pd.DataFrame, events_tr: pd.DataFrame, train_month
     motif_kept = [c for c in keep_names if cross_sources.get(c) == "motif"]
     curated_kept = [c for c in keep_names if cross_sources.get(c) == "curated"]
     if enable_curated:
-        top_cur = ", ".join(curated_kept[:5]) if curated_kept else "-"
+        examples_cur = ", ".join(curated_kept[:3]) if curated_kept else "-"
         print(
-            f"[ml] curated crosses kept {len(curated_kept)} of {curated_total} (cap {cross_cap}); top={top_cur}",
+            f"[ml] curated crosses kept {len(curated_kept)} of {curated_total} (cap {cross_cap}); examples: {examples_cur}",
             flush=True,
         )
     if use_motif_crosses:
@@ -613,6 +660,8 @@ def train_ml_gating(cands_tr: pd.DataFrame, events_tr: pd.DataFrame, train_month
     print(f"[ml] total crosses used: {len(keep_names)} (cap {cross_cap})", flush=True)
 
     used_crosses = {"motif": motif_kept, "curated": curated_kept}
+    with open(art_dir / "ml_used_crosses.json", "w", encoding="utf-8") as f:
+        json.dump(used_crosses, f, ensure_ascii=False, indent=2)
 
     from scipy import sparse
 
@@ -641,8 +690,10 @@ def train_ml_gating(cands_tr: pd.DataFrame, events_tr: pd.DataFrame, train_month
                             n_estimators=int(ne), max_depth=int(md), learning_rate=float(lr), subsample=float(ss)
                         )
                         clf.fit(X_fit.toarray(), y_fit, sample_weight=sw_fit)
-                        cal = CalibratedClassifierCV(clf, method="isotonic", cv="prefit")
-                        cal.fit(X_val.toarray(), y_val)
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", category=FutureWarning)
+                            cal = CalibratedClassifierCV(clf, method="isotonic", cv="prefit")
+                            cal.fit(X_val.toarray(), y_val)
                         p_val = cal.predict_proba(X_val.toarray())[:,1]
                         ap = average_precision_score(y_val, p_val)
                         best = max(best or (-1,None,None,{}), (ap, clf, cal, {"n_estimators":ne,"max_depth":md,"learning_rate":lr,"subsample":ss}), key=lambda t:t[0])
@@ -652,8 +703,10 @@ def train_ml_gating(cands_tr: pd.DataFrame, events_tr: pd.DataFrame, train_month
         for C in c_grid:
             clf = LogisticRegression(penalty="l2", C=float(C), solver="liblinear", class_weight=cw, max_iter=300)
             clf.fit(X_fit, y_fit)
-            cal = CalibratedClassifierCV(clf, method="isotonic", cv="prefit")
-            cal.fit(X_val, y_val)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=FutureWarning)
+                cal = CalibratedClassifierCV(clf, method="isotonic", cv="prefit")
+                cal.fit(X_val, y_val)
             p_val = cal.predict_proba(X_val)[:,1]
             ap = average_precision_score(y_val, p_val)
             best = max(best or (-1,None,None,{"C":C}), (ap, clf, cal, {"C":C}), key=lambda t:t[0])
@@ -678,18 +731,26 @@ def train_ml_gating(cands_tr: pd.DataFrame, events_tr: pd.DataFrame, train_month
         flush=True,
     )
 
-    art_dir = Path(out_dir) / "artifacts"
-    art_dir.mkdir(parents=True, exist_ok=True)
     import joblib
     joblib.dump(clf, art_dir / f"ml_{model_name}_base.pkl")
     joblib.dump(cal, art_dir / f"ml_{model_name}_calibrated.pkl")
     joblib.dump(enc, art_dir / "ml_encoder.pkl")
     with open(art_dir / "ml_bins.json","w",encoding="utf-8") as f: json.dump(bin_schema, f, ensure_ascii=False, indent=2)
+    bin_sample: Dict[str, List[float]] = {}
+    for idx, (feat, edges) in enumerate(bin_schema.get("cont", {}).items()):
+        if idx >= 5:
+            break
+        try:
+            seq = list(edges)
+        except TypeError:
+            seq = [edges]
+        trimmed = seq[: min(len(seq), 6)] if seq else []
+        bin_sample[feat] = [float(e) for e in trimmed]
     with open(art_dir / "ml_meta.json","w",encoding="utf-8") as f:
         json.dump({
             "model": model_name, "params": params, "ap_val": float(ap),
             "tau": tau, "target_ppv": target_ppv, "achieved_lcb": ach, "coverage_val": cov,
-            "train_months": train_months, "used_crosses": used_crosses
+            "train_months": train_months, "used_crosses": used_crosses, "bin_sample": bin_sample
         }, f, ensure_ascii=False, indent=2)
     return {"tau": tau, "model": model_name}
 
@@ -704,16 +765,25 @@ def score_ml(cands_df: pd.DataFrame, fold_dir: Path, ml_cfg: dict) -> pd.Series:
     with open(art / "ml_bins.json","r",encoding="utf-8") as f: bins = json.load(f)
 
     Xc, _, _, _ = build_feature_matrix(cands_df, ml_cfg, is_train=False, bin_schema=bins)
-    expected_cols = list(getattr(enc, "feature_names_in_", []))
-    if expected_cols:
-        for col in expected_cols:
-            if col not in Xc.columns:
-                fill = pd.Categorical(np.zeros(len(Xc), dtype=int), categories=[0])
-                Xc[col] = pd.Series(fill, index=Xc.index)
-        Xc = Xc[expected_cols]
+    try:
+        with open(art / "ml_input_cols.json", "r", encoding="utf-8") as f:
+            persisted_cols = json.load(f)
+    except Exception:
+        persisted_cols = []
+    encoder_inputs = list(getattr(enc, "feature_names_in_", []))
+    expected_cols = encoder_inputs or list(persisted_cols)
+    Xc = _align_input_columns(Xc, expected_cols)
     X = enc.transform(Xc)
 
-    used_cross_meta = meta.get("used_crosses", {})
+    used_cross_path = art / "ml_used_crosses.json"
+    if used_cross_path.exists():
+        try:
+            with open(used_cross_path, "r", encoding="utf-8") as f:
+                used_cross_meta = json.load(f)
+        except Exception:
+            used_cross_meta = meta.get("used_crosses", {})
+    else:
+        used_cross_meta = meta.get("used_crosses", {})
     if isinstance(used_cross_meta, dict):
         motif_names = list(used_cross_meta.get("motif", []))
         curated_names = list(used_cross_meta.get("curated", []))
@@ -730,17 +800,16 @@ def score_ml(cands_df: pd.DataFrame, fold_dir: Path, ml_cfg: dict) -> pd.Series:
 
     extra_blocks = []
     cross_counts = {"motif": 0, "curated": 0}
-    if expected_cols:
-        aligned = list(expected_cols) == list(Xc.columns)
-        print(
-            f"[ml] scoring: encoder columns aligned={aligned} (expected={len(expected_cols)}, got={len(Xc.columns)})",
-            flush=True,
-        )
+    if encoder_inputs:
+        aligned = list(encoder_inputs) == list(Xc.columns)
+        expected_len = len(encoder_inputs)
     else:
-        print(
-            f"[ml] scoring: encoder columns aligned=True (expected=0, got={len(Xc.columns)})",
-            flush=True,
-        )
+        aligned = list(expected_cols) == list(Xc.columns)
+        expected_len = len(expected_cols)
+    print(
+        f"[ml] scoring: encoder columns aligned={aligned} (expected={expected_len}, got={len(Xc.columns)})",
+        flush=True,
+    )
 
     gating_path = art / "gating.json"
     if motif_names and use_motif_crosses:

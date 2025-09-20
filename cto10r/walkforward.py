@@ -1174,18 +1174,32 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
             mask_reg = m
 
     combine = str(ml_cfg.get("combine_with_motifs", "and")).lower()
-    if combine == "and":
-        keep_mask = mask_motif & mask_ml & mask_reg
-    elif combine == "or":
-        keep_mask = (mask_motif | mask_ml) & mask_reg
-    elif combine == "ml_only":
-        keep_mask = mask_ml & mask_reg
+    if combine == "ml_only":
+        mask = mask_ml & mask_reg
     elif combine == "motifs_only":
-        keep_mask = mask_motif & mask_reg
+        mask = mask_motif & mask_reg
+    elif combine == "or":
+        mask = (mask_motif | mask_ml) & mask_reg
+    elif combine == "and":
+        mask = (mask_motif & mask_ml) & mask_reg
     else:
-        keep_mask = mask_motif & mask_ml & mask_reg
+        mask = (mask_motif & mask_ml) & mask_reg
 
-    ev_g = ev.loc[keep_mask].copy()
+    ev_g = ev.loc[mask].copy()
+
+    sched_cfg = sim_cfg.get("scheduler", {"enabled": True, "weight": "expR"})
+    if bool(sched_cfg.get("enabled", True)):
+        take_sched = schedule_non_overlapping(
+            ev_g, weight_mode=str(sched_cfg.get("weight", "expR")).lower(), r_mult=r_mult
+        )
+    else:
+        take_sched = ev_g
+
+    total_candidates = len(cands_t_norm)
+    gated_count = int(mask.sum()) if len(mask) else 0
+    _log(
+        f"[SIM] combine={combine} total={total_candidates} gated={gated_count} scheduled={len(take_sched)}"
+    )
 
     g_wins = int((take_sched["outcome"] == "win").sum())
     g_losses = int((take_sched["outcome"] == "loss").sum())
@@ -1193,13 +1207,6 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
     g_denom = max(g_wins + g_losses, 1)
     g_wr = g_wins / g_denom if g_denom else 0.0
     g_expR = g_wr * r_mult + (1.0 - g_wr) * (-1.0)
-
-    # Scheduler
-    sched_cfg = sim_cfg.get("scheduler", {"enabled": True, "weight": "expR"})
-    if bool(sched_cfg.get("enabled", True)):
-        take_sched = schedule_non_overlapping(ev_g, weight_mode=str(sched_cfg.get("weight","expR")).lower(), r_mult=r_mult)
-    else:
-        take_sched = ev_g
 
     trades_g = take_sched[take_sched["outcome"].isin(["win", "loss"])].copy()
     trades_g["R"] = np.where(trades_g["outcome"] == "win", r_mult, -1.0)
