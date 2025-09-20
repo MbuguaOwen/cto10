@@ -129,15 +129,57 @@ ml_gating:
     learning_rate: [0.05, 0.1]
     subsample: [0.7, 1.0]
   class_weight: "balanced"
-  n_bins_cont: 5
-  features:
-    include_prefixes: ["qbin_", "qbin_agebin_", "since_", "occ_"]
-    exclude_prefixes: []
-  use_motif_crosses: true
   combine_with_motifs: "ml_only"  # and | or | ml_only | motifs_only
   regime_gate: true
   regime_min_age_bin: 4
   regime_occ_windows: [240]
+  features:
+    include_prefixes: ["qbin_", "qbin_agebin_", "since_", "occ_"]
+    exclude_prefixes: []
+  # ----- new: adaptive binning -----
+  n_bins_cont: auto                   # "auto" enables per-feature selection; else int
+  binning:
+    candidates: [3,4,5,7,10]
+    min_bin_frac: 0.005               # >=0.5% per bin after merges
+    mi_delta_min: 0.002
+    ece_delta_min: 0.002
+    max_js_month_drift: 0.15
+    prefer_monotone: true
+  # ----- new: curated crosses -----
+  crosses:
+    use_motif_crosses: true           # keep existing data-driven crosses
+    enable_curated: true
+    max_total: 30                     # hard cap (includes motif crosses actually kept)
+    top_k_literals_from_winners: 20   # for motif-driven crosses
+    curated:                          # hand-picked pairs; conditions auto-mapped
+      # Regime strength × Regime agreement
+      - [ "qbin_nl_trend_agree_15_60:high", "qbin_nl_trend_agree_60_240:high" ]
+      - [ "qbin_nl_trend_ratio_15_60:high", "qbin_nl_zcr_60:low" ]
+
+      # Compression age × Release trigger
+      - [ "agebin_nl_squeeze_score:old", "qbin_nl_squeeze_score:high" ]
+      - [ "agebin_nl_squeeze_score:old", "qbin_nl_release_slope_15:pos" ]
+
+      # Extreme proximity × Impulse
+      - [ "qbin_close_to_hi_atr:near", "nl_impulse_near_high:eq1" ]
+      - [ "qbin_close_to_lo_atr:near", "nl_impulse_near_low:eq1" ]
+
+      # Chop filters for trend entries
+      - [ "qbin_nl_zcr_60:low", "qbin_nl_sign_entropy_60:low" ]
+      - [ "qbin_nl_dc_count_60:low", "qbin_nl_trend_agree_60_240:high" ]
+
+      # Range/Vol structure
+      - [ "qbin_nl_range_ratio_60:low", "qbin_nl_rv60_over_atr:high" ]
+      - [ "qbin_nl_volofvol_proxy:low", "qbin_nl_trend_agree_60_240:high" ]
+
+      # Shape × Trend
+      - [ "qbin_nl_convexity_15_60_240:high", "qbin_nl_trend_ratio_15_60:high" ]
+      - [ "qbin_body_dom:high", "qbin_close_to_hi_atr:near_or_low" ]   # near (low bin) or top proximity bucket
+      - [ "qbin_body_dom:high", "qbin_close_to_lo_atr:near_or_low" ]
+
+      # Occupancy/Since × Trend
+      - [ "occ_highbin_t_60_W240:high", "qbin_nl_trend_agree_60_240:high" ]
+      - [ "since_lowbin_dcw:small", "qbin_nl_trend_agree_15_60:high" ]
 
 execution_sim:
   use_rules: true
