@@ -1,4 +1,5 @@
-import json, math
+import json
+import math
 import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -925,3 +926,338 @@ def schedule_non_overlapping(df: pd.DataFrame, weight_mode: str = "expR", r_mult
         else: i -= 1
     sel = np.array(sorted(sel))
     return df.iloc[order[sel]].copy()
+
+
+def _extract_y(df: pd.DataFrame) -> np.ndarray:
+    if "y" not in df.columns:
+        return np.full(len(df), np.nan, dtype=float)
+    y = pd.to_numeric(df["y"], errors="coerce").to_numpy(dtype=float, copy=False)
+    return y
+
+
+def build_design_matrix(
+    df: pd.DataFrame,
+    features_cfg: dict,
+    crosses_cap: int = 30,
+    val_df: pd.DataFrame | None = None,
+):
+    """Fit feature transforms on df and return (X, y, feature_meta)."""
+    from scipy import sparse
+
+    work = df.copy()
+    y = _extract_y(work)
+
+    ml_cfg = features_cfg or {}
+    inc = list(ml_cfg.get("features", {}).get("include_prefixes", ["qbin_", "qbin_agebin_", "since_", "occ_"]))
+    exc = list(ml_cfg.get("features", {}).get("exclude_prefixes", []))
+    all_cols = select_feature_cols(work, inc, exc)
+    cont_cols = [c for c in all_cols if c.startswith(("since_", "occ_"))]
+
+    bin_schema = {"cont": {}}
+    auto_bins = str(ml_cfg.get("n_bins_cont", "auto")).lower() == "auto"
+
+    if val_df is not None and not val_df.empty:
+        val_ref = val_df.copy()
+    else:
+        val_ref = work.copy()
+    y_val = _extract_y(val_ref)
+    months_fit = sorted(map(str, work.get("ym", pd.Series([], dtype=str)).dropna().unique().tolist()))
+
+    if auto_bins:
+        for c in cont_cols:
+            if c not in work.columns:
+                continue
+            try:
+                edges = _choose_bins_for_feature(work, val_ref, c, y, y_val, months_fit, ml_cfg)
+            except Exception:
+                edges = auto_bin_train(work.loc[:, c], 5)
+            if isinstance(edges, np.ndarray):
+                edges = edges.tolist()
+            bin_schema["cont"][c] = edges
+    else:
+        n_fixed = int(ml_cfg.get("n_bins_cont", 5))
+        for c in cont_cols:
+            if c not in work.columns:
+                continue
+            edges = auto_bin_train(work.loc[:, c], n_fixed)
+            if isinstance(edges, np.ndarray):
+                edges = edges.tolist()
+            bin_schema["cont"][c] = edges
+
+    X_train_skel, enc, bin_schema, cat_cols = build_feature_matrix(work, ml_cfg, is_train=True, bin_schema=bin_schema)
+    expected_inputs = list(getattr(enc, "feature_names_in_", [])) or list(cat_cols)
+
+    X_cat, _, _, _ = build_feature_matrix(work, ml_cfg, is_train=False, bin_schema=bin_schema)
+    X_cat = _align_input_columns(X_cat, expected_inputs)
+    X_base = enc.transform(X_cat)
+
+    if val_ref is not None and len(val_ref):
+        X_val_cat, _, _, _ = build_feature_matrix(val_ref, ml_cfg, is_train=False, bin_schema=bin_schema)
+        X_val_cat = _align_input_columns(X_val_cat, expected_inputs)
+    else:
+        X_val_cat = None
+
+    cross_cfg = ml_cfg.get("crosses", {})
+    use_motif = bool(cross_cfg.get("use_motif_crosses", ml_cfg.get("use_motif_crosses", True)))
+    enable_curated = bool(cross_cfg.get("enable_curated", True))
+    motif_limit = int(cross_cfg.get("top_k_literals_from_winners", 20))
+    gating_path = ml_cfg.get("gating_path")
+    gating_path = Path(gating_path) if gating_path else None
+
+    df_train_cross = pd.DataFrame(index=work.index)
+    df_val_cross = pd.DataFrame(index=X_val_cat.index) if X_val_cat is not None else pd.DataFrame()
+    cross_sources: Dict[str, str] = {}
+
+    if crosses_cap > 0:
+        if use_motif and gating_path and gating_path.exists():
+            motif_train, _ = build_motif_crosses(X_cat, gating_path, limit_pairs=motif_limit)
+            if motif_train.shape[1]:
+                df_train_cross = pd.concat([df_train_cross, motif_train], axis=1)
+                cross_sources.update({c: "motif" for c in motif_train.columns})
+                if X_val_cat is not None:
+                    motif_val, _ = build_motif_crosses(X_val_cat, gating_path, limit_pairs=motif_limit)
+                    motif_val = motif_val.reindex(columns=motif_train.columns, fill_value=0)
+                    df_val_cross = pd.concat([df_val_cross, motif_val], axis=1)
+        if enable_curated:
+            curated_train = build_curated_crosses(X_cat, ml_cfg)
+            if curated_train.shape[1]:
+                df_train_cross = pd.concat([df_train_cross, curated_train], axis=1)
+                cross_sources.update({c: "curated" for c in curated_train.columns})
+                if X_val_cat is not None:
+                    curated_val = build_curated_crosses(X_val_cat, ml_cfg)
+                    curated_val = curated_val.reindex(columns=curated_train.columns, fill_value=0)
+                    df_val_cross = pd.concat([df_val_cross, curated_val], axis=1)
+
+    if df_train_cross.empty or crosses_cap <= 0:
+        keep_names: List[str] = []
+    else:
+        if df_val_cross.empty:
+            df_val_cross = df_train_cross.copy()
+            y_val_use = y
+        else:
+            y_val_use = y_val
+        keep_names = _limit_and_filter_crosses(
+            df_train_cross,
+            df_val_cross,
+            y,
+            y_val_use,
+            int(crosses_cap),
+        )
+
+    X = X_base
+    if keep_names:
+        train_cross = df_train_cross[keep_names].astype(np.float32)
+        X = sparse.hstack([X_base, sparse.csr_matrix(train_cross.values)], format="csr")
+
+    feature_meta = {
+        "encoder": enc,
+        "bin_schema": bin_schema,
+        "expected_inputs": expected_inputs,
+        "cross_names": keep_names,
+        "cross_sources": {name: cross_sources.get(name, "") for name in keep_names},
+        "gating_path": str(gating_path) if gating_path else None,
+        "motif_limit": motif_limit,
+        "literal_columns": list(X_cat.columns),
+    }
+
+    return X, y, feature_meta
+
+
+def transform_design_matrix(
+    df: pd.DataFrame,
+    features_cfg: dict,
+    feature_meta: dict,
+):
+    """Apply previously fitted feature_meta to df."""
+    from scipy import sparse
+
+    work = df.copy()
+    y = _extract_y(work)
+    bin_schema = feature_meta.get("bin_schema", {"cont": {}})
+    enc = feature_meta["encoder"]
+    expected_inputs = feature_meta.get("expected_inputs", [])
+
+    X_cat, _, _, _ = build_feature_matrix(work, features_cfg, is_train=False, bin_schema=bin_schema)
+    X_cat = _align_input_columns(X_cat, expected_inputs)
+    X_base = enc.transform(X_cat)
+
+    literal_df = X_cat.apply(lambda col: col.astype(str))
+
+    blocks = [X_base]
+    cross_names = feature_meta.get("cross_names", [])
+    cross_sources = feature_meta.get("cross_sources", {})
+    gating_path = feature_meta.get("gating_path")
+    motif_limit = int(feature_meta.get("motif_limit", len(cross_names)))
+
+    if cross_names:
+        motif_names = [name for name in cross_names if cross_sources.get(name) == "motif"]
+        curated_names = [name for name in cross_names if cross_sources.get(name) == "curated"]
+        if motif_names and gating_path:
+            gp = Path(gating_path)
+            motif_df, _ = build_motif_crosses(X_cat, gp, limit_pairs=max(len(motif_names), motif_limit))
+            motif_df = motif_df.reindex(columns=motif_names, fill_value=0)
+            if motif_df.shape[1]:
+                blocks.append(sparse.csr_matrix(motif_df.astype(np.float32).values))
+        if curated_names:
+            curated_df = build_curated_crosses(X_cat, features_cfg)
+            curated_df = curated_df.reindex(columns=curated_names, fill_value=0)
+            if curated_df.shape[1]:
+                blocks.append(sparse.csr_matrix(curated_df.astype(np.float32).values))
+
+    if len(blocks) == 1:
+        X = blocks[0]
+    else:
+        X = sparse.hstack(blocks, format="csr")
+
+    return X, y, literal_df
+
+
+def train_classifier(
+    X,
+    y: np.ndarray,
+    features_cfg: dict,
+    X_val=None,
+    y_val: np.ndarray | None = None,
+):
+    model_name = str(features_cfg.get("model", "logreg")).lower()
+    y_fit = np.asarray(y, dtype=float)
+    mask = np.isfinite(y_fit)
+    if mask.any():
+        X_fit = X[mask]
+        y_fit = y_fit[mask]
+    else:
+        X_fit = X
+    y_fit = y_fit.astype(int)
+
+    if y_val is not None:
+        y_val = np.asarray(y_val, dtype=float)
+
+    if model_name == "gbdt":
+        from scipy import sparse
+
+        X_dense = X_fit.toarray() if sparse.issparse(X_fit) else np.asarray(X_fit)
+        class_weight = str(features_cfg.get("class_weight", "balanced"))
+        if class_weight == "balanced":
+            pos = max(1, int((y_fit == 1).sum()))
+            neg = max(1, int((y_fit == 0).sum()))
+            w_pos = neg / (pos + neg)
+            w_neg = pos / (pos + neg)
+            sample_weight = np.where(y_fit == 1, w_pos, w_neg)
+        else:
+            sample_weight = None
+        grid = features_cfg.get(
+            "gbdt_grid",
+            {"n_estimators": [200], "max_depth": [3], "learning_rate": [0.1], "subsample": [1.0]},
+        )
+        best: Tuple[float, GradientBoostingClassifier] | None = None
+        for ne in grid.get("n_estimators", [200]):
+            for md in grid.get("max_depth", [3]):
+                for lr in grid.get("learning_rate", [0.1]):
+                    for ss in grid.get("subsample", [1.0]):
+                        clf = GradientBoostingClassifier(
+                            n_estimators=int(ne),
+                            max_depth=int(md),
+                            learning_rate=float(lr),
+                            subsample=float(ss),
+                        )
+                        clf.fit(X_dense, y_fit, sample_weight=sample_weight)
+                        if X_val is not None and y_val is not None and len(y_val):
+                            X_val_dense = X_val.toarray() if sparse.issparse(X_val) else np.asarray(X_val)
+                            mask_val = np.isfinite(y_val)
+                            if mask_val.any():
+                                y_eval = y_val[mask_val].astype(int)
+                                X_eval = X_val_dense[mask_val]
+                            else:
+                                y_eval = y_fit
+                                X_eval = X_dense
+                        else:
+                            y_eval = y_fit
+                            X_eval = X_dense
+                        p = clf.predict_proba(X_eval)[:, 1]
+                        score = average_precision_score(y_eval, p)
+                        if best is None or score > best[0]:
+                            best = (score, clf)
+        if best is None:
+            raise RuntimeError("GBDT training failed to produce a model")
+        return best[1]
+
+    c_grid = [float(c) for c in features_cfg.get("c_grid", [0.1, 0.2, 0.5, 1.0])]
+    class_weight = features_cfg.get("class_weight", "balanced")
+    best_lr: Tuple[float, LogisticRegression] | None = None
+    for C in c_grid:
+        clf = LogisticRegression(
+            penalty="l2",
+            C=float(C),
+            solver="liblinear",
+            class_weight=class_weight,
+            max_iter=400,
+        )
+        clf.fit(X_fit, y_fit)
+        if X_val is not None and y_val is not None and len(y_val):
+            mask_val = np.isfinite(y_val)
+            if mask_val.any():
+                y_eval = y_val[mask_val].astype(int)
+                X_eval = X_val[mask_val]
+            else:
+                y_eval = y_fit
+                X_eval = X_fit
+        else:
+            y_eval = y_fit
+            X_eval = X_fit
+        p = clf.predict_proba(X_eval)[:, 1]
+        score = average_precision_score(y_eval, p)
+        if best_lr is None or score > best_lr[0]:
+            best_lr = (score, clf)
+
+    if best_lr is None:
+        raise RuntimeError("Logistic regression training failed to produce a model")
+    return best_lr[1]
+
+
+def calibrate_probabilities(clf, X, y, method: str = "isotonic"):
+    method_name = str(method).lower()
+    cal_method = "sigmoid" if method_name in {"platt", "sigmoid"} else "isotonic"
+
+    y_arr = np.asarray(y, dtype=float)
+    mask = np.isfinite(y_arr)
+    if mask.any():
+        X_fit = X[mask]
+        y_fit = y_arr[mask].astype(int)
+    else:
+        X_fit = X
+        y_fit = y_arr.astype(int)
+
+    unique, counts = np.unique(y_fit, return_counts=True)
+    min_class = int(counts.min()) if len(counts) else 0
+    n_samples = int(len(y_fit))
+
+    if min_class < 2 or n_samples < 2:
+        # Degenerate case: calibrate on the provided data without CV.
+        cal = CalibratedClassifierCV(clf, method=cal_method, cv="prefit")
+        cal.fit(X_fit, y_fit)
+        return cal
+
+    cv = min(5, min_class, n_samples)
+    cv = max(cv, 2)
+    cal = CalibratedClassifierCV(clf, method=cal_method, cv=cv)
+    cal.fit(X_fit, y_fit)
+    return cal
+
+
+def evaluate_ppv_lcb_at_threshold(probs: np.ndarray, y: np.ndarray, tau: float) -> Dict[str, float]:
+    if len(probs) != len(y):
+        raise ValueError("probs and y must be same length")
+    mask = np.isfinite(probs)
+    probs = probs[mask]
+    y = y[mask]
+    if len(probs) == 0:
+        return {"ppv": 0.0, "ppv_lcb": 0.0, "cov": 0.0}
+    pred = probs >= float(tau)
+    cov = float(pred.mean())
+    pos = int(pred.sum())
+    if pos == 0:
+        return {"ppv": 0.0, "ppv_lcb": 0.0, "cov": cov}
+    tp = int(((pred == 1) & (y == 1)).sum())
+    ppv = tp / pos if pos else 0.0
+    ppv_lcb = wilson_lcb(tp, pos)
+    return {"ppv": float(ppv), "ppv_lcb": float(ppv_lcb), "cov": cov}

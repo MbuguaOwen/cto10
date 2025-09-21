@@ -1,6 +1,7 @@
 import math
 import json
 from pathlib import Path
+from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
@@ -132,11 +133,13 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
         "unique_months",
     ]
 
-    def emit_empty() -> dict:
+    def emit_empty() -> tuple[dict, pd.DataFrame]:
         payload = {"promoted": []}
         (artifacts_dir / "gating.json").write_text(json.dumps(payload, indent=2))
-        pd.DataFrame(columns=stats_columns).to_csv(artifacts_dir / "rules_eval.csv", index=False)
-        return payload
+        empty_stats = pd.DataFrame(columns=stats_columns)
+        empty_stats.to_csv(artifacts_dir / "rules_eval.csv", index=False)
+        mined = pd.DataFrame(columns=["rule_id", "kind", "support", "months_with_lift", "precision", "precision_lcb", "lits"])
+        return payload, mined
 
     join_cols = ["ts", "side", "entry", "level", "risk_dist"]
     df = cands.merge(events, on=join_cols, how="inner", suffixes=("", ""))
@@ -426,6 +429,20 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
     if not rule_stats:
         return emit_empty()
 
+    def conds_to_lits(conds: list[dict]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for c in conds or []:
+            if not isinstance(c, dict):
+                continue
+            feat = c.get("feat")
+            if feat is None:
+                continue
+            val = c.get("val")
+            if val is None:
+                val = c.get("thr")
+            out.append({"col": str(feat), "val": val})
+        return out
+
     stats = pd.DataFrame(rule_stats.values()).reindex(columns=stats_columns)
 
     metric_map = {
@@ -488,4 +505,28 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
     stats.to_csv(artifacts_dir / "rules_eval.csv", index=False)
     print(f"[mining] promoted={len(promoted_full)} losers={len(losers_payload)}", flush=True)
 
-    return payload
+    mined_df = stats.copy()
+    mined_df["kind"] = "candidate"
+    if promoted_ids:
+        mined_df.loc[mined_df["rule_id"].isin(promoted_ids), "kind"] = "winner"
+    if losers_payload:
+        loser_ids = [r["rule_id"] for r in losers_payload if isinstance(r, dict) and "rule_id" in r]
+        if loser_ids:
+            mined_df.loc[mined_df["rule_id"].isin(loser_ids), "kind"] = "loser"
+    mined_df["support"] = mined_df["support_n"].astype(int, errors="ignore")
+    mined_df["lits"] = mined_df["rule_id"].map(lambda rid: conds_to_lits(rule_payload.get(rid, {}).get("conds", [])))
+    cols_order = [
+        "rule_id",
+        "kind",
+        "support",
+        "months_with_lift",
+        "precision",
+        "precision_lcb",
+        "lits",
+    ]
+    for col in cols_order:
+        if col not in mined_df.columns:
+            mined_df[col] = np.nan
+    mined_df = mined_df[cols_order + [c for c in mined_df.columns if c not in cols_order]]
+
+    return payload, mined_df

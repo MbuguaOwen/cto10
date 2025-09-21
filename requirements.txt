@@ -4,3 +4,5 @@ pyyaml>=6.0
 tqdm>=4.66
 fastparquet
 pyarrow
+scipy>=1.10
+scikit-learn>=1.2
