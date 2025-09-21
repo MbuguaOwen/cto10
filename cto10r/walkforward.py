@@ -1131,30 +1131,67 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
     ev = ev.sort_values("ts").reset_index(drop=True)
 
     decision_df = cands_t_norm.copy()
-    total_candidates = int(len(decision_df))
-    if "enter" in decision_df.columns:
-        entries = int(pd.to_numeric(decision_df["enter"], errors="coerce").fillna(0).astype(bool).sum())
+    default_enter = pd.Series(False, index=decision_df.index, dtype=bool)
+    go_series = (
+        pd.to_numeric(decision_df.get("enter", default_enter), errors="coerce")
+        .fillna(0)
+        .astype(bool)
+    )
+
+    label_merge_cols = [c for c in join_cols if c in decision_df.columns and c in ev.columns]
+    if label_merge_cols:
+        label_lookup = ev[label_merge_cols + ["outcome"]].copy()
+        label_lookup["label_resolved"] = label_lookup["outcome"].map({
+            "win": 1,
+            "loss": -1,
+            "timeout": 0,
+        })
+        label_lookup = label_lookup.drop_duplicates(subset=label_merge_cols, keep="last")
+        decision_df = decision_df.merge(
+            label_lookup[label_merge_cols + ["label_resolved"]],
+            on=label_merge_cols,
+            how="left",
+        )
+        if "label" in decision_df.columns:
+            decision_df["label"] = pd.to_numeric(decision_df["label"], errors="coerce")
+            decision_df["label"] = decision_df["label"].fillna(decision_df.pop("label_resolved"))
+        else:
+            decision_df["label"] = decision_df.pop("label_resolved")
     else:
-        entries = 0
-    decided_cov = safe_div(entries, total_candidates)
+        decision_df["label"] = pd.to_numeric(
+            decision_df.get("label", pd.Series(np.nan, index=decision_df.index)),
+            errors="coerce",
+        )
 
-    decided_events = ev[ev["enter"] == True].copy()
-    wins_dec = int((decided_events["outcome"] == "win").sum())
-    losses_dec = int((decided_events["outcome"] == "loss").sum())
-    timeouts_dec = int((decided_events["outcome"] == "timeout").sum())
-    resolved_dec = wins_dec + losses_dec
-    ppv_resolved = safe_div(wins_dec, resolved_dec)
-    R_metric = float(labels_cfg_sim.get("r_mult", 5.0))
-    net_R = wins_dec * R_metric - losses_dec * 1.0
-    avg_R_per_entry = safe_div(net_R, entries)
-    g_ratio = (wins_dec * R_metric / losses_dec) if losses_dec > 0 else 0.0
+    decision_df["label"] = pd.to_numeric(decision_df["label"], errors="coerce")
+    decision_df["enter"] = go_series.to_numpy()
 
-    tau_series = pd.to_numeric(decision_df.get("tau_used", pd.Series([], dtype=float)), errors="coerce")
-    tau_series = tau_series.dropna()
+    tau_series = pd.to_numeric(decision_df.get("tau_used", pd.Series([], dtype=float)), errors="coerce").dropna()
     if len(tau_series):
         tau_used_val = float(tau_series.iloc[0])
     else:
-        tau_used_val = float(gate_tau) if gate_tau == gate_tau else 0.0
+        tau_used_val = float(gate_tau) if gate_tau == gate_tau else float(getattr(gate, "tau", 0.0))
+
+    R_metric = float(cfg.get("labels", {}).get("r_mult", 5))
+    dec = decision_df.loc[decision_df["enter"]]
+    entries = int(len(dec))
+    wins = int((dec["label"] == 1).sum())
+    losses = int((dec["label"] == -1).sum())
+    timeouts = int((dec["label"] == 0).sum())
+    resolved = wins + losses
+
+    if entries != (wins + losses + timeouts):
+        _log(
+            f"[sim][warn] entries({entries}) != wins+losses+timeouts({wins + losses + timeouts}); "
+            "using decided_df length for entries."
+        )
+
+    total_candidates = int(len(decision_df))
+    decided_cov = safe_div(entries, total_candidates)
+    ppv_resolved = safe_div(wins, resolved)
+    net_R = wins * R_metric - losses * 1.0
+    avg_R_per_entry = safe_div(net_R, entries)
+    g_ratio = (wins * R_metric) / max(1, losses)
 
     _log(
         "[sim] tau_used={:.4f} entries={} of {} ({:.3%}) | wins={} losses={} timeouts={} "
@@ -1163,9 +1200,9 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
             entries,
             total_candidates,
             decided_cov,
-            wins_dec,
-            losses_dec,
-            timeouts_dec,
+            wins,
+            losses,
+            timeouts,
             ppv_resolved,
             net_R,
             avg_R_per_entry,
@@ -1173,8 +1210,35 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
         )
     )
 
+    stats_path = spath
+    try:
+        with stats_path.open("r", encoding="utf-8") as fh:
+            stats_data = json.load(fh)
+    except Exception:
+        stats_data = {}
+
+    decided_metrics = {
+        "tau_used": tau_used_val,
+        "entries": entries,
+        "total_candidates": total_candidates,
+        "total_candidates_scored": total_candidates,
+        "decided_coverage": decided_cov,
+        "wins": wins,
+        "losses": losses,
+        "timeouts": timeouts,
+        "resolved": resolved,
+        "ppv_resolved": ppv_resolved,
+        "R_mult": R_metric,
+        "net_R": net_R,
+        "avg_R_per_entry": avg_R_per_entry,
+        "g_ratio": g_ratio,
+    }
+
+    stats_data.update(decided_metrics)
+    dump_json(stats_data, stats_path)
+
     coverage = decided_cov if total_candidates else (float(ev["enter"].mean()) if len(ev) else 0.0)
-    empirical_ppv = ppv_resolved if resolved_dec else float("nan")
+    empirical_ppv = ppv_resolved if resolved else float("nan")
     ppv_str = f"{empirical_ppv:.3f}" if empirical_ppv == empirical_ppv else "nan"
     _log(f"[sim] decided_cov={coverage:.3f} decided_empirical_ppv={ppv_str}")
 
@@ -1216,23 +1280,7 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
         }
     )
 
-    stats_existing.update(
-        {
-            "tau_used": tau_used_val,
-            "entries": entries,
-            "total_candidates_scored": total_candidates,
-            "decided_coverage": decided_cov,
-            "wins": wins_dec,
-            "losses": losses_dec,
-            "timeouts": timeouts_dec,
-            "resolved": resolved_dec,
-            "ppv_resolved": ppv_resolved,
-            "R_mult": R_metric,
-            "net_R": net_R,
-            "avg_R_per_entry": avg_R_per_entry,
-            "g_ratio": g_ratio,
-        }
-    )
+    stats_existing.update(decided_metrics)
 
     dump_json(stats_existing, spath)
     _log(

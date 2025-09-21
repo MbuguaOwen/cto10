@@ -285,18 +285,42 @@ def sgn(x: pd.Series) -> pd.Series:
     v = pd.to_numeric(x, errors="coerce")
     return (v > 0).astype(np.int8) - (v < 0).astype(np.int8)
 
-def safe_div(a, b, eps: float = 1e-12):
+def safe_div(num, den):
     """Safe division for scalars, Series, or numpy arrays."""
-    if isinstance(a, (pd.Series, np.ndarray)) or isinstance(b, (pd.Series, np.ndarray)):
-        num = pd.to_numeric(a, errors="coerce")
-        den = pd.to_numeric(b, errors="coerce").abs() + eps
-        return num / den
+    if isinstance(num, pd.Series) or isinstance(den, pd.Series):
+        if isinstance(num, pd.Series):
+            num_ser = pd.to_numeric(num, errors="coerce")
+        else:
+            converted_num = pd.to_numeric(num, errors="coerce")
+            idx = den.index if isinstance(den, pd.Series) else None
+            num_ser = pd.Series(converted_num, index=idx)
+
+        if isinstance(den, pd.Series):
+            den_ser = pd.to_numeric(den, errors="coerce")
+        else:
+            converted_den = pd.to_numeric(den, errors="coerce")
+            den_ser = pd.Series(converted_den, index=num_ser.index)
+
+        den_ser = den_ser.replace(0, np.nan)
+        res = num_ser / den_ser
+        return res.fillna(0.0)
+
+    if isinstance(num, np.ndarray) or isinstance(den, np.ndarray):
+        num_arr = np.asarray(num, dtype=float)
+        den_arr = np.asarray(den, dtype=float)
+        num_b, den_b = np.broadcast_arrays(num_arr, den_arr)
+        out = np.zeros_like(num_b, dtype=float)
+        mask = den_b != 0
+        np.divide(num_b, den_b, out=out, where=mask)
+        out[~np.isfinite(out)] = 0.0
+        return out
+
     try:
-        num_f = float(a)
-        den_f = float(b)
+        num_f = float(num)
+        den_f = float(den)
     except (TypeError, ValueError):
         return 0.0
-    if abs(den_f) <= eps:
+    if den_f == 0.0:
         return 0.0
     return num_f / den_f
 
