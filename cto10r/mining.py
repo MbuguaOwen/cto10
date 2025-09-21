@@ -111,16 +111,24 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
         "rule_id",
         "support_n",
         "wins",
+        "win_n",
         "losses",
+        "loss_n",
         "timeouts",
+        "tout_n",
+        "resolved_n",
+        "res_n",
         "precision",
         "precision_lcb",
+        "prec_lcb",
         "precision_ucb",
+        "prec_ucb",
         "resolve_frac",
         "timeout_rate",
         "lift",
         "lift_lcb",
         "months_with_lift",
+        "months_hit",
         "unique_months",
     ]
 
@@ -285,20 +293,29 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
         # Precision UCB for loser mining: use same n as precision denominator
         p_ucb = wilson_ucb(wins, n, z=z_score)
 
+        resolved_n = int(resolved_n)
         metrics = {
             "rule_id": rule_id,
             "support_n": int(n),
             "wins": int(wins),
+            "win_n": int(wins),
             "losses": int(losses),
+            "loss_n": int(losses),
             "timeouts": int(tos),
+            "tout_n": int(tos),
+            "resolved_n": resolved_n,
+            "res_n": resolved_n,
             "resolve_frac": float(resolve_frac),
             "timeout_rate": float(timeout_rate),
             "precision": float(p_hat),
             "precision_lcb": float(p_lcb),
+            "prec_lcb": float(p_lcb),
             "precision_ucb": float(p_ucb),
+            "prec_ucb": float(p_ucb),
             "lift": float(lift),
             "lift_lcb": float(lift_lcb),
             "months_with_lift": int(months_with_lift),
+            "months_hit": int(months_with_lift),
             "unique_months": int(unique_months),
         }
         existing = rule_stats.get(rule_id)
@@ -315,16 +332,27 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
             rule_payload[rule_id] = {
                 "rule_id": rule_id,
                 "conds": conds,
-                "precision": metrics["precision"],
-                "precision_lcb": metrics["precision_lcb"],
                 "support_n": metrics["support_n"],
                 "wins": metrics["wins"],
+                "win_n": metrics["win_n"],
                 "losses": metrics["losses"],
+                "loss_n": metrics["loss_n"],
                 "timeouts": metrics["timeouts"],
+                "tout_n": metrics["tout_n"],
+                "resolved_n": metrics["resolved_n"],
+                "res_n": metrics["res_n"],
+                "precision": metrics["precision"],
+                "precision_lcb": metrics["precision_lcb"],
+                "precision_ucb": metrics["precision_ucb"],
+                "prec_lcb": metrics["prec_lcb"],
+                "prec_ucb": metrics["prec_ucb"],
+                "resolve_frac": metrics["resolve_frac"],
+                "timeout_rate": metrics["timeout_rate"],
+                "months_with_lift": metrics["months_with_lift"],
+                "months_hit": metrics["months_hit"],
                 "lift": metrics["lift"],
                 "lift_lcb": metrics["lift_lcb"],
                 "unique_months": metrics["unique_months"],
-                "months_with_lift": metrics["months_with_lift"],
             }
 
     if auto:
@@ -423,11 +451,12 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
         rules_df["lift_lcb"] >= lift_threshold
     )
 
-    baseline_resolve = base_resolve
-    uplift_pp = float(min_resolve_uplift_pp)
-    min_resolve_floor = float(min_resolve_frac) if min_resolve_frac is not None else 0.0
-    required_resolve = min(baseline_resolve + uplift_pp / 100.0, 0.98)
-    keep &= rules_df["resolve_frac"] >= np.maximum(required_resolve, min_resolve_floor)
+    baseline_resolve = float(base_resolve)
+    uplift_pp = float(min_resolve_uplift_pp) if min_resolve_uplift_pp is not None else 0.0
+    uplift_res = uplift_pp / 100.0
+    resolve_uplift_thresh = min(0.99, baseline_resolve + uplift_res)
+    resolve_floor = float(min_resolve_frac) if min_resolve_frac is not None else 0.0
+    keep &= rules_df["resolve_frac"] >= max(resolve_floor, resolve_uplift_thresh)
 
     if max_timeout_rate is not None:
         keep &= rules_df["timeout_rate"] <= float(max_timeout_rate)

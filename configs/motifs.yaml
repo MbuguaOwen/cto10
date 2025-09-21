@@ -104,7 +104,7 @@ mining:
     precision_include_timeouts: false
     # NEW: data-relative strictness
     min_precision_uplift_pp: 8        # require LCB >= baseline_precision + 8 percentage points
-    min_resolve_uplift_pp: 10         # require resolve_frac >= baseline_resolve + 10 pp
+    min_resolve_uplift_pp: 5          # require resolve_frac >= baseline_resolve + 5 pp
     max_timeout_rate: 0.50            # drop motifs with timeout share > 50% of its own matches
     min_resolve_frac: 0.30            # and require at least 30% of matches to resolve
     # Optional absolute floors (set to null to disable)
