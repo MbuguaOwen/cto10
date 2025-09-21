@@ -14,6 +14,10 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import average_precision_score, brier_score_loss
 
 
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 def wilson_lcb(k: int, n: int, z: float = 1.96) -> float:
     if n <= 0:
         return 0.0
@@ -42,6 +46,24 @@ def apply_bins(series: pd.Series, edges: np.ndarray) -> pd.Series:
     x = pd.to_numeric(series, errors="coerce")
     idx = np.clip(np.digitize(x, edges, right=False) - 1, 0, len(edges)-2)
     return pd.Series(idx.astype(np.int16), index=series.index)
+
+
+def _safe_corrcoef(X: np.ndarray) -> np.ndarray:
+    # X shape: [n_samples, n_features]
+    if X.ndim != 2:
+        cols = X.shape[1] if X.ndim > 1 else (X.shape[0] if X.ndim == 1 else 0)
+        return np.eye(max(1, cols), dtype=float)
+    if X.shape[0] == 0 or X.shape[1] < 2:
+        return np.eye(max(1, X.shape[1]), dtype=float)
+    col_std = np.nanstd(X, axis=0)
+    keep = np.isfinite(col_std) & (col_std > 1e-12)
+    if keep.sum() < 2:
+        return np.eye(int(keep.sum()), dtype=float)
+    Xk = X[:, keep]
+    Xk = (Xk - np.nanmean(Xk, axis=0)) / np.nanstd(Xk, axis=0)
+    C = np.corrcoef(np.nan_to_num(Xk), rowvar=False)
+    C = np.nan_to_num(C, nan=0.0, posinf=0.0, neginf=0.0)
+    return C
 
 
 def _ece(probs: np.ndarray, y: np.ndarray, n_bins: int = 10) -> float:
@@ -130,6 +152,8 @@ def _choose_bins_for_feature(
     valid_fit = x_fit.dropna()
     if valid_fit.empty:
         return [-np.inf, np.inf]
+    if valid_fit.nunique(dropna=True) <= 1:
+        return [-np.inf, np.inf]
 
     logistic_ok = len(np.unique(y_fit)) > 1 and len(np.unique(y_val)) > 1
     best: Tuple[float, float, float, List[float]] | None = None
@@ -208,12 +232,16 @@ def _choose_bins_for_feature(
             continue
 
         try:
-            mi_score = pd.Series(p_val).corr(pd.Series(y_val), method="pearson")
+            arr = np.column_stack(
+                [np.asarray(p_val, dtype=float), np.asarray(y_val, dtype=float)]
+            )
+            C = _safe_corrcoef(arr)
+            if C.shape[0] >= 2 and C.shape[1] >= 2:
+                mi_score = abs(float(C[0, 1]))
+            else:
+                mi_score = 0.0
         except Exception:
             mi_score = 0.0
-        if mi_score is None or np.isnan(mi_score):
-            mi_score = 0.0
-        mi_score = abs(float(mi_score))
 
         ece = _ece(np.asarray(p_val, dtype=float), np.asarray(y_val, dtype=float), n_bins=10)
         try:
@@ -713,22 +741,47 @@ def train_ml_gating(cands_tr: pd.DataFrame, events_tr: pd.DataFrame, train_month
 
     ap, clf, cal, params = best
 
-    target_ppv = float(ml_cfg.get("target_ppv", 0.70)); z = 1.96
-    p_val = cal.predict_proba(X_val.toarray() if model_name=="gbdt" else X_val)[:,1]
-    dfv = pd.DataFrame({"p": p_val, "y": y_val}).sort_values("p", ascending=False)
-    dfv["tp"] = dfv["y"].cumsum(); dfv["n"] = np.arange(1, len(dfv)+1)
+    target_ppv = float(ml_cfg.get("target_ppv", 0.70))
+    z = 1.96
+    p_val = cal.predict_proba(X_val.toarray() if model_name == "gbdt" else X_val)[:, 1]
+    dfv = pd.DataFrame({"p": p_val, "y": y_val})
+    dfv = dfv.sort_values("p", ascending=False).reset_index(drop=True)
+    dfv["tp"] = dfv["y"].cumsum()
+    dfv["n"] = np.arange(1, len(dfv) + 1, dtype=int)
+    dfv["ppv"] = dfv["tp"] / dfv["n"].clip(lower=1)
     dfv["lcb"] = dfv.apply(lambda r: wilson_lcb(int(r.tp), int(r.n), z), axis=1)
-    ok = dfv[dfv["lcb"] >= target_ppv]
-    if len(ok):
-        k = int(ok.index[0]) + 1; tau = float(dfv.iloc[k-1]["p"]); cov = float(k/len(dfv)); ach = float(dfv.iloc[k-1]["lcb"])
+    total = len(dfv)
+    if total > 0:
+        ok = dfv[dfv["lcb"] >= target_ppv]
+        if len(ok):
+            k = int(ok["n"].iloc[0])
+            k = max(1, min(k, total))
+            tau = float(dfv.iloc[k - 1]["p"])
+            cov = float(k / total)
+            ach = float(dfv.iloc[k - 1]["lcb"])
+        else:
+            min_cov = float(ml_cfg.get("min_coverage_frac", 0.02))
+            k = max(1, int(min_cov * total))
+            k = max(1, min(k, total))
+            tau = float(dfv.iloc[k - 1]["p"])
+            cov = float(k / total)
+            ach = float(dfv.iloc[k - 1]["lcb"])
     else:
-        min_cov = float(ml_cfg.get("min_coverage_frac", 0.02))
-        k = max(1, int(min_cov * max(1,len(dfv)))); tau = float(dfv.iloc[k-1]["p"]); cov = float(k/len(dfv)); ach = float(dfv.iloc[k-1]["lcb"])
+        tau = 0.0
+        cov = 0.0
+        ach = 0.0
 
-    print(
-        f"[ml] gating meta: model={model_name} params={params} ap_val={ap:.3f} tau={tau:.4f} "
-        f"target_ppv={target_ppv:.2f} achieved_lcb={ach:.3f} coverage={cov:.3f}",
-        flush=True,
+    sym = cfg.get("symbol") or cfg.get("sym") or ml_cfg.get("symbol") or ml_cfg.get("sym")
+    if not sym:
+        try:
+            sym = Path(out_dir).parent.name
+        except Exception:
+            sym = "ml"
+    sym = str(sym or "ml")
+
+    _log(
+        f"[{sym}] ml_gating: model={model_name} params={params} AP_val={ap:.3f} "
+        f"tau={tau:.4f} target={target_ppv:.2f} LCB@tau={ach:.3f} cov={cov:.3f}"
     )
 
     import joblib
