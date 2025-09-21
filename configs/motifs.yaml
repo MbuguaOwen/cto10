@@ -117,6 +117,21 @@ mining:
     loser_min_resolve_frac: 0.40
     loser_min_months: 2
 
+gate:
+  mode: ml
+  calibration: isotonic
+  target_ppv_lcb: 0.60
+  min_coverage: 0.03
+  val_months: 1
+  crosses_cap: 30
+
+loser_mask:
+  enabled: true
+  min_support: 40
+  min_months_with_lift: 2
+  min_ppv_lcb: 0.55
+  save_artifact: true
+
 ml_gating:
   enabled: true
   model: logreg            # logreg | gbdt

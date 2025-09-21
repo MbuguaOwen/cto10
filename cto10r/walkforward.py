@@ -11,6 +11,7 @@ import json
 
 
 import shutil
+import copy
 
 
 from dataclasses import dataclass
@@ -51,7 +52,14 @@ from .ticks import iter_ticks_files, stream_ticks_window, label_events_from_tick
 
 
 from .mining import mine_rules, prepare_literal_buckets
-from .ml import train_ml_gating, score_ml, schedule_non_overlapping
+from .ml import schedule_non_overlapping
+from .gate import (
+    GateConfig,
+    LoserMaskConfig,
+    train_gate,
+    load_trained_gate,
+    literalize_candidates,
+)
 
 
 # ------------------------ constants ------------------------
@@ -888,30 +896,96 @@ def stage_mining(sym: str, train_months: List[str], test_months: List[str], cfg:
     progress_on = bool(cfg.get("io", {}).get("progress", True))
 
 
-    res = mine_rules(cands_tr, events_tr, {"rules": rules_cfg, "out_dir": str(fold_dir), "features": cfg.get("features", {}), "progress": progress_on})
+    mining_payload, mined_df = mine_rules(
+        cands_tr,
+        events_tr,
+        {"rules": rules_cfg, "out_dir": str(fold_dir), "features": cfg.get("features", {}), "progress": progress_on},
+    )
 
-
-    promoted = res.get("promoted", [])
-
+    promoted = mining_payload.get("promoted", [])
 
     _log(f"[{sym}] mining: rows={len(events_tr)} promoted={len(promoted)}")
 
-    # Train ML gating on TRAIN
-    ml_cfg = cfg.get("ml_gating", {})
-    if bool(ml_cfg.get("enabled", False)):
-        _log(f"[{sym}] ml_gating: training {ml_cfg.get('model','logreg')}...")
+    gate_cfg_raw = cfg.get("gate", {}) or {}
+    loser_cfg_raw = cfg.get("loser_mask", {}) or {}
+    gate_cfg = GateConfig(
+        calibration=str(gate_cfg_raw.get("calibration", "isotonic")),
+        target_ppv_lcb=float(gate_cfg_raw.get("target_ppv_lcb", 0.60)),
+        min_coverage=float(gate_cfg_raw.get("min_coverage", 0.03)),
+        crosses_cap=int(gate_cfg_raw.get("crosses_cap", 30)),
+        val_months=int(gate_cfg_raw.get("val_months", 1)),
+    )
+    loser_cfg = LoserMaskConfig(
+        enabled=bool(loser_cfg_raw.get("enabled", True)),
+        min_support=int(loser_cfg_raw.get("min_support", 40)),
+        min_months_with_lift=int(loser_cfg_raw.get("min_months_with_lift", 2)),
+        min_ppv_lcb=float(loser_cfg_raw.get("min_ppv_lcb", 0.55)),
+        save_artifact=bool(loser_cfg_raw.get("save_artifact", True)),
+    )
+
+    gate_features_cfg = copy.deepcopy(cfg.get("ml_gating", {}))
+    gate_features_cfg["gating_path"] = str(fold_dir / "artifacts" / "gating.json")
+
+    labels = events_tr[events_tr["outcome"].isin(["win", "loss"])].copy()
+    labels["y"] = (labels["outcome"] == "win").astype(int)
+    if "ym" not in labels.columns and "ym" in events_tr.columns:
+        labels["ym"] = events_tr.loc[labels.index, "ym"].to_numpy()
+    if "ym" not in labels.columns and "ym" in cands_tr.columns:
+        labels = labels.merge(
+            cands_tr[["ts", "ym"]].drop_duplicates("ts"),
+            on="ts",
+            how="left",
+            suffixes=("", "_cand"),
+        )
+        if "ym_cand" in labels.columns:
+            labels["ym"] = labels["ym"].fillna(labels.pop("ym_cand"))
+
+    label_cols = ["ts", "y"]
+    if "ym" in labels.columns:
+        label_cols.append("ym")
+    all_train = cands_tr.merge(labels[label_cols], on="ts", how="inner")
+    if "ym_x" in all_train.columns:
+        all_train["ym"] = all_train.pop("ym_x")
+    if "ym_y" in all_train.columns:
+        all_train["ym"] = all_train.pop("ym_y")
+    if "ym" not in all_train.columns:
+        months_sorted = sorted(set(train_months))
+        default_month = months_sorted[-1] if months_sorted else "unknown"
+        all_train["ym"] = default_month
+    all_train["ym"] = all_train["ym"].astype(str)
+
+    val_months = []
+    if gate_cfg.val_months > 0:
+        months_sorted = sorted({str(m) for m in train_months})
+        val_months = months_sorted[-gate_cfg.val_months :]
+    val_mask = all_train["ym"].isin(val_months) if val_months else pd.Series(False, index=all_train.index)
+    val_df = all_train[val_mask].copy()
+    train_core = all_train[~val_mask].copy()
+    if train_core.empty:
+        train_core = all_train.copy()
+    if val_df.empty:
+        val_df = all_train.copy()
+
+    artifacts_dir = fold_dir / "artifacts"
+
+    if len(train_core) and train_core["y"].nunique() > 1:
         try:
-            train_ml_gating(cands_tr, events_tr, train_months, {"ml_gating": ml_cfg}, fold_dir)
-            # log ML meta summary
-            try:
-                art = Path(fold_dir) / "artifacts"
-                with open(art / "ml_meta.json","r",encoding="utf-8") as f:
-                    meta = json.load(f)
-                _log(f"[{sym}] ml_gating: model={meta.get('model')} params={meta.get('params')} AP_val={meta.get('ap_val'):.3f} tau={meta.get('tau'):.4f} LCB@tau={meta.get('achieved_lcb'):.3f} cov={meta.get('coverage_val'):.3f}")
-            except Exception:
-                pass
+            gate, diag = train_gate(
+                train_core,
+                val_df,
+                gate_features_cfg,
+                gate_cfg,
+                loser_cfg,
+                mined_df,
+                artifacts_dir,
+            )
+            _log(
+                f"[{sym}] gate: τ={diag['tau']:.4f} PPV={diag['ppv']:.3f} LCB={diag['ppv_lcb']:.3f} cov={diag['cov']:.3f} loser_rules={diag['loser_rules']}"
+            )
         except Exception as e:
-            _log(f"[{sym}] ml_gating: training failed: {e}")
+            _log(f"[{sym}] gate training failed: {e}")
+    else:
+        _log(f"[{sym}] gate: insufficient labeled data for training (rows={len(train_core)})")
 
 
 def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cfg: Dict[str, Any], fold_dir: Path, force: bool) -> None:
@@ -1007,199 +1081,108 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
 
 
     rules = []
-    blocklist = []
-
     gpath = fold_dir / "artifacts" / "gating.json"
-
     if gpath.exists():
-
-        with open(gpath, "r") as f:
-
+        with open(gpath, "r", encoding="utf-8") as f:
             data = json.load(f)
             rules = data.get("promoted", [])
-            blocklist = data.get("blocklist", [])
-
     ev["rule_id"] = assign_best_rule_id(ev, rules) if rules else None
 
+    gate_bundle = fold_dir / "artifacts" / "gate_bundle.pkl"
+    gate_features_cfg = copy.deepcopy(cfg.get("ml_gating", {}))
+    gate_features_cfg["gating_path"] = str(gpath)
+    gate_tau = float("nan")
+    coverage = 0.0
+    empirical_ppv = float("nan")
+    if gate_bundle.exists():
+        try:
+            gate = load_trained_gate(gate_bundle)
+            X_test, y_test, literals = literalize_candidates(cands_t_norm, gate_features_cfg, gate.feature_meta)
+            p_vals = gate.score(X_test)
+            losers_fire = gate.loser_mask_vec(literals)
+            enter_mask = (p_vals >= gate.tau) & (~losers_fire)
+            cands_t_norm = cands_t_norm.copy()
+            cands_t_norm["p_win"] = p_vals
+            cands_t_norm["loser_mask"] = losers_fire
+            cands_t_norm["enter"] = enter_mask
+            cands_t_norm["tau_used"] = gate.tau
+            gate_tau = gate.tau
+        except Exception as e:
+            _log(f"[{sym}] gate scoring failed: {e}")
+    if "p_win" not in cands_t_norm.columns:
+        cands_t_norm = cands_t_norm.copy()
+        cands_t_norm["p_win"] = np.nan
+        cands_t_norm["loser_mask"] = False
+        cands_t_norm["enter"] = False
+        cands_t_norm["tau_used"] = gate_tau
+
+    ev = ev.merge(
+        cands_t_norm[["ts", "p_win", "loser_mask", "enter", "tau_used"]],
+        on="ts",
+        how="left",
+    )
+    ev["p_win"] = pd.to_numeric(ev["p_win"], errors="coerce")
+    ev["loser_mask"] = ev["loser_mask"].fillna(False)
+    ev["enter"] = ev["enter"].fillna(False)
+    ev["tau_used"] = ev["tau_used"].fillna(gate_tau)
 
     ev = ev.sort_values("ts").reset_index(drop=True)
 
+    coverage = float(ev["enter"].mean()) if len(ev) else 0.0
+    resolved_entries = ev[ev["enter"] & ev["outcome"].isin(["win", "loss"])]
+    if len(resolved_entries):
+        wins_dec = int((resolved_entries["outcome"] == "win").sum())
+        losses_dec = int((resolved_entries["outcome"] == "loss").sum())
+        denom_dec = wins_dec + losses_dec
+        if denom_dec > 0:
+            empirical_ppv = wins_dec / denom_dec
+    ppv_str = f"{empirical_ppv:.3f}" if empirical_ppv == empirical_ppv else "nan"
+    _log(f"[sim] decided_cov={coverage:.3f} decided_empirical_ppv={ppv_str}")
 
     total = int(len(ev))
-
-
     wins = int((ev["outcome"] == "win").sum())
-
-
     losses = int((ev["outcome"] == "loss").sum())
-
-
     timeouts = int((ev["outcome"] == "timeout").sum())
-
-
     denom = max(wins + losses, 1)
-
-
     wr = wins / denom if denom else 0.0
-
-
     expR = wr * r_mult + (1.0 - wr) * (-1.0)
 
-
     trades = ev[ev["outcome"].isin(["win", "loss"])].copy()
-
-
     trades["R"] = np.where(trades["outcome"] == "win", r_mult, -1.0)
-
-
     trades.to_csv(tpath, index=False)
-
 
     cands_t_norm.to_csv(trpath, index=False)
 
-
     wins_fp_cols = ["ts", "side", "rule_id"] + [c for c in RULE_FINGERPRINT_FEATURES if c in ev.columns]
-
-
     ev.loc[ev["outcome"] == "win", wins_fp_cols].to_csv(fold_dir / "wins_fingerprints.csv", index=False)
 
-
     stats = {
-
-
         "total_events": total,
-
-
         "wins": wins,
-
-
         "losses": losses,
-
-
         "timeouts": timeouts,
-
-
         "win_rate": wr,
-
-
         "expected_R_per_event": expR,
-
-
         "r_mult": r_mult,
-
-
+        "gate_coverage": coverage,
     }
-
-
     write_json(spath, stats)
-
-
     _log(f"[{sym}] simulate: total={total}, wr={wr:.3f}, expR={expR:.2f}, wins={wins}, losses={losses}, timeouts={timeouts}")
 
+    ev_g = ev[ev["enter"]].copy()
+    gated_count = int(ev_g.shape[0])
 
-    sim_cfg = cfg.get("execution_sim", {})
-    ml_cfg  = cfg.get("ml_gating", {})
-
-    # Apply loser blocklist first, if configured
-    if bool(sim_cfg.get("use_blocklist", False)) and blocklist:
-        def _row_matches_any(row):
-            for r in blocklist:
-                conds = r.get("conds", [])
-                if conds and rule_hit_row(row, conds):
-                    return True
-            return False
-        if not ev.empty:
-            mask_block = ev.apply(_row_matches_any, axis=1)
-            blocked = int(mask_block.sum())
-            if blocked > 0:
-                _log(f"[{sym}] simulate: blocklist filtered {blocked} events")
-            ev = ev.loc[~mask_block].copy()
-
-    # ML gating
-    if bool(ml_cfg.get("enabled", False)) and len(cands_t_norm) > 0:
-        try:
-            p = score_ml(cands_t_norm, fold_dir, ml_cfg)
-            cands_t_norm = cands_t_norm.copy()
-            cands_t_norm["pwin"] = p
-            from pathlib import Path as _P
-            with open(_P(fold_dir)/"artifacts"/"ml_meta.json","r",encoding="utf-8") as f:
-                meta = json.load(f)
-            tau = float(meta.get("tau", 0.5))
-            cands_t_norm["ml_gate"] = (cands_t_norm["pwin"] >= tau).astype(bool)
-            ev = ev.merge(cands_t_norm[["ts","pwin","ml_gate"]], on="ts", how="left")
-            ev["pwin"] = pd.to_numeric(ev["pwin"], errors="coerce")
-            ev["ml_gate"] = ev["ml_gate"].fillna(False)
-        except Exception as e:
-            _log(f"[{sym}] simulate: ML scoring failed: {e}")
-
-    # Winner voting (k-of-n) if rules used
-    if bool(sim_cfg.get("use_rules", False)) and rules:
-        thr = float(sim_cfg.get("min_rule_precision_lcb", 0.0))
-        sup_min = int(sim_cfg.get("min_rule_support", 0))
-        good_rules = [r for r in rules if r.get("support_n", 0) >= sup_min and r.get("precision_lcb", 0.0) >= thr]
-        min_votes = int(sim_cfg.get("min_winner_votes", 1))
-        def _votes(row):
-            v = 0
-            for r in good_rules:
-                conds = r.get("conds", [])
-                if conds and rule_hit_row(row, conds):
-                    v += 1
-            return v
-        if not ev.empty:
-            ev["winner_votes"] = ev.apply(_votes, axis=1).astype(int)
-            mask_motif = (ev["winner_votes"] >= min_votes).to_numpy()
-        else:
-            mask_motif = np.zeros(len(ev), dtype=bool)
-    else:
-        mask_motif = np.ones(len(ev), dtype=bool)
-
-    # ML mask
-    if "ml_gate" in ev.columns:
-        mask_ml = ev["ml_gate"].to_numpy()
-    else:
-        mask_ml = np.ones(len(ev), dtype=bool)
-
-    # Regime mask: any qbin_agebin_* >= regime_min_age_bin
-    mask_reg = np.ones(len(ev), dtype=bool)
-    if bool(ml_cfg.get("regime_gate", False)) and len(ev) > 0:
-        thr_age = int(ml_cfg.get("regime_min_age_bin", 4))
-        cols_age = [c for c in ev.columns if c.startswith("qbin_agebin_")]
-        if cols_age:
-            m = np.zeros(len(ev), dtype=bool)
-            for c in cols_age:
-                try:
-                    m |= (pd.to_numeric(ev[c], errors="coerce") >= thr_age).to_numpy()
-                except Exception:
-                    continue
-            mask_reg = m
-
-    combine = str(ml_cfg.get("combine_with_motifs", "and")).lower()
-    if combine == "ml_only":
-        mask = mask_ml & mask_reg
-    elif combine == "motifs_only":
-        mask = mask_motif & mask_reg
-    elif combine == "or":
-        mask = (mask_motif | mask_ml) & mask_reg
-    elif combine == "and":
-        mask = (mask_motif & mask_ml) & mask_reg
-    else:
-        mask = (mask_motif & mask_ml) & mask_reg
-
-    ev_g = ev.loc[mask].copy()
-
-    sched_cfg = sim_cfg.get("scheduler", {"enabled": True, "weight": "expR"})
+    sched_cfg = cfg.get("execution_sim", {}).get("scheduler", {"enabled": True, "weight": "expR"})
     if bool(sched_cfg.get("enabled", True)):
         take_sched = schedule_non_overlapping(
-            ev_g, weight_mode=str(sched_cfg.get("weight", "expR")).lower(), r_mult=r_mult
+            ev_g,
+            weight_mode=str(sched_cfg.get("weight", "expR")).lower(),
+            r_mult=r_mult,
         )
     else:
         take_sched = ev_g
 
-    total_candidates = len(cands_t_norm)
-    gated_count = int(mask.sum()) if len(mask) else 0
-    _log(
-        f"[SIM] combine={combine} total={total_candidates} gated={gated_count} scheduled={len(take_sched)}"
-    )
+    _log(f"[SIM] coverage={coverage:.3f} selected={gated_count} scheduled={len(take_sched)}")
 
     g_wins = int((take_sched["outcome"] == "win").sum())
     g_losses = int((take_sched["outcome"] == "loss").sum())
@@ -1213,7 +1196,10 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
     trades_g.to_csv(fold_dir / "trades_gated.csv", index=False)
 
     wins_fp_cols_g = ["ts", "side"] + [c for c in RULE_FINGERPRINT_FEATURES if c in take_sched.columns]
-    take_sched.loc[take_sched["outcome"] == "win", wins_fp_cols_g].to_csv(fold_dir / "wins_fingerprints_gated.csv", index=False)
+    take_sched.loc[take_sched["outcome"] == "win", wins_fp_cols_g].to_csv(
+        fold_dir / "wins_fingerprints_gated.csv",
+        index=False,
+    )
 
     write_json(
         fold_dir / "stats_gated.json",
@@ -1225,11 +1211,10 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
             "win_rate": g_wr,
             "expected_R_per_event": g_expR,
             "r_mult": r_mult,
-            "rules_used": int(len(rules)),
         },
     )
 
-    _log(f"[{sym}] simulate[GATED]: kept={len(ev_g)} scheduled={len(take_sched)} wr={g_wr:.3f} expR={g_expR:.2f} combine={combine}")
+    _log(f"[{sym}] simulate[GATED]: kept={len(ev_g)} scheduled={len(take_sched)} wr={g_wr:.3f} expR={g_expR:.2f}")
 
 
 # ------------------------ orchestrator ------------------------
