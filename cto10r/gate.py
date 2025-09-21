@@ -26,7 +26,7 @@ except Exception:  # pragma: no cover - joblib is expected in runtime env
 class GateConfig:
     calibration: str = "isotonic"
     target_ppv_lcb: float = 0.60
-    min_coverage: float = 0.03
+    min_coverage: float = 0.02
     crosses_cap: int = 30
     val_months: int = 1
 
@@ -34,8 +34,8 @@ class GateConfig:
 @dataclass
 class LoserMaskConfig:
     enabled: bool = True
-    min_support: int = 40
-    min_months_with_lift: int = 2
+    min_support: int = 20
+    min_months_with_lift: int = 0
     min_ppv_lcb: float = 0.55
     save_artifact: bool = True
 
@@ -78,12 +78,18 @@ def choose_tau_by_targets(
     target_ppv_lcb: float,
     min_cov: float,
 ) -> Tuple[float, Dict[str, float]]:
-    taus = np.linspace(0.95, 0.50, 46)
     best = {"tau": 0.5, "ppv": 0.0, "ppv_lcb": 0.0, "cov": 0.0}
     hit = None
     n = len(probs_val)
     if n == 0:
         return best["tau"], best
+    finite_probs = probs_val[np.isfinite(probs_val)]
+    if finite_probs.size == 0:
+        taus = np.array([0.0])
+    else:
+        qs = np.linspace(1.0, 0.0, 201)
+        taus = np.unique(np.quantile(finite_probs, qs))
+        taus = taus[::-1]
     for t in taus:
         pred = probs_val >= t
         cov = float(pred.mean())
