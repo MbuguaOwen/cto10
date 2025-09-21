@@ -1,3 +1,4 @@
+import gc
 import math
 import json
 from pathlib import Path
@@ -51,6 +52,19 @@ def rule_precision_counts(sub: pd.DataFrame, include_timeouts: bool) -> tuple[in
     else:
         n = int(wins + losses)
     return n, wins, losses, timeouts
+
+
+def _narrow_subframe(work: pd.DataFrame, mask: np.ndarray | pd.Series, cols_needed: list[str]) -> pd.DataFrame:
+    cols = [c for c in cols_needed if c in work.columns]
+    sub = work.loc[mask, cols].copy()
+    # make grouping keys lightweight
+    for c in cols:
+        if c in ("ym",) or c.startswith("B_"):
+            try:
+                sub[c] = sub[c].astype("category")
+            except Exception:
+                pass
+    return sub
 
 
 
@@ -383,7 +397,9 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
                 mask_pair = work[col_i].notna() & work[col_j].notna()
                 if not mask_pair.any():
                     continue
-                for (val_i, val_j), sub in work[mask_pair].groupby([col_i, col_j], observed=True):
+                cols_needed = [col_i, col_j, "is_win", "is_loss", "is_to", "ym"]
+                subframe = _narrow_subframe(work, mask_pair, cols_needed)
+                for (val_i, val_j), sub in subframe.groupby([col_i, col_j], observed=True, sort=False):
                     conds = [
                         {"feat": col_i, "op": "==", "thr": float(val_i)},
                         {"feat": col_j, "op": "==", "thr": float(val_j)},
@@ -391,6 +407,7 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
                     register_rule(canonical_rule_id(conds), conds, sub)
             if progress_on and hasattr(iter_2d, "close"):
                 iter_2d.close()
+            gc.collect()
     else:
         iter_1d_pairs = tqdm(literal_pairs, desc="mine 1D", dynamic_ncols=True, leave=False) if progress_on else literal_pairs
         for feat, col in iter_1d_pairs:
@@ -418,13 +435,18 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
                 mask_pair = work[col_i].notna() & work[col_j].notna()
                 if not mask_pair.any():
                     continue
-                for (val_i, val_j), sub in work[mask_pair].groupby([col_i, col_j], observed=True):
-                    conds = bin_to_conditions(feat_i, val_i, bin_edges[feat_i]) + bin_to_conditions(feat_j, val_j, bin_edges[feat_j])
+                cols_needed = [col_i, col_j, "is_win", "is_loss", "is_to", "ym"]
+                subframe = _narrow_subframe(work, mask_pair, cols_needed)
+                for (val_i, val_j), sub in subframe.groupby([col_i, col_j], observed=True, sort=False):
+                    conds_i = bin_to_conditions(feat_i, val_i, bin_edges[feat_i])
+                    conds_j = bin_to_conditions(feat_j, val_j, bin_edges[feat_j])
+                    conds = (conds_i or []) + (conds_j or [])
                     if not conds:
                         continue
                     register_rule(canonical_rule_id(conds), conds, sub)
             if progress_on and hasattr(iter_2d_pairs, "close"):
                 iter_2d_pairs.close()
+            gc.collect()
 
     if not rule_stats:
         return emit_empty()
