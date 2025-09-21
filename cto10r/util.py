@@ -1,11 +1,17 @@
-\
+from __future__ import annotations
+
+import json
+import math
+import os
+import sys
+import time
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Tuple
+
 import numpy as np
 import pandas as pd
-
-import math
-import traceback, sys, json, os, time
-from dataclasses import dataclass
-from typing import Tuple
 
 def eta_from_atr_percentile(atr_p: pd.Series, default_eta: float, table: list | None) -> pd.Series:
     '''Piecewise mapping from ATR percentile to eta (SL = eta * ATR).
@@ -75,6 +81,13 @@ def safe_write(path, writer_fn):
     tmp = str(path) + ".tmp"
     writer_fn(tmp)
     os.replace(tmp, str(path))
+
+
+def dump_json(obj, path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
 
 def exception_to_report(step, cfg_dict, out_dir, e):
     rep = {
@@ -272,8 +285,20 @@ def sgn(x: pd.Series) -> pd.Series:
     v = pd.to_numeric(x, errors="coerce")
     return (v > 0).astype(np.int8) - (v < 0).astype(np.int8)
 
-def safe_div(a: pd.Series, b: pd.Series, eps: float = 1e-12) -> pd.Series:
-    return pd.to_numeric(a, errors="coerce") / (pd.to_numeric(b, errors="coerce").abs() + eps)
+def safe_div(a, b, eps: float = 1e-12):
+    """Safe division for scalars, Series, or numpy arrays."""
+    if isinstance(a, (pd.Series, np.ndarray)) or isinstance(b, (pd.Series, np.ndarray)):
+        num = pd.to_numeric(a, errors="coerce")
+        den = pd.to_numeric(b, errors="coerce").abs() + eps
+        return num / den
+    try:
+        num_f = float(a)
+        den_f = float(b)
+    except (TypeError, ValueError):
+        return 0.0
+    if abs(den_f) <= eps:
+        return 0.0
+    return num_f / den_f
 
 def zero_cross_rate(x: pd.Series, window: int) -> pd.Series:
     s = pd.to_numeric(x, errors="coerce").fillna(0.0)

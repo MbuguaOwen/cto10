@@ -39,7 +39,7 @@ from tqdm.auto import tqdm
 from .io_utils import ensure_dir, write_json, skip_if_exists
 
 
-from .util import exception_to_report, infer_bar_seconds
+from .util import exception_to_report, infer_bar_seconds, safe_div, dump_json
 
 
 from .bars import load_bars_any, build_features, fit_percentiles, apply_percentiles, add_age_features, add_nonlinear_features
@@ -1027,7 +1027,8 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
     cands, _ = prepare_literal_buckets(cands, train_mask_all, rules_cfg, features_cfg)
 
 
-    r_mult = float(cfg["labels"].get("r_mult", 10.0))
+    labels_cfg_sim = cfg.get("labels", {}) or {}
+    r_mult = float(labels_cfg_sim.get("r_mult", 5.0))
 
 
     join_cols = ["ts", "side", "entry", "level", "risk_dist"]
@@ -1094,6 +1095,7 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
     gate_tau = float("nan")
     coverage = 0.0
     empirical_ppv = float("nan")
+    gate = None
     if gate_bundle.exists():
         try:
             gate = load_trained_gate(gate_bundle)
@@ -1128,24 +1130,61 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
 
     ev = ev.sort_values("ts").reset_index(drop=True)
 
-    coverage = float(ev["enter"].mean()) if len(ev) else 0.0
-    resolved_entries = ev[ev["enter"] & ev["outcome"].isin(["win", "loss"])]
-    if len(resolved_entries):
-        wins_dec = int((resolved_entries["outcome"] == "win").sum())
-        losses_dec = int((resolved_entries["outcome"] == "loss").sum())
-        denom_dec = wins_dec + losses_dec
-        if denom_dec > 0:
-            empirical_ppv = wins_dec / denom_dec
+    decision_df = cands_t_norm.copy()
+    total_candidates = int(len(decision_df))
+    if "enter" in decision_df.columns:
+        entries = int(pd.to_numeric(decision_df["enter"], errors="coerce").fillna(0).astype(bool).sum())
+    else:
+        entries = 0
+    decided_cov = safe_div(entries, total_candidates)
+
+    decided_events = ev[ev["enter"] == True].copy()
+    wins_dec = int((decided_events["outcome"] == "win").sum())
+    losses_dec = int((decided_events["outcome"] == "loss").sum())
+    timeouts_dec = int((decided_events["outcome"] == "timeout").sum())
+    resolved_dec = wins_dec + losses_dec
+    ppv_resolved = safe_div(wins_dec, resolved_dec)
+    R_metric = float(labels_cfg_sim.get("r_mult", 5.0))
+    net_R = wins_dec * R_metric - losses_dec * 1.0
+    avg_R_per_entry = safe_div(net_R, entries)
+    g_ratio = (wins_dec * R_metric / losses_dec) if losses_dec > 0 else 0.0
+
+    tau_series = pd.to_numeric(decision_df.get("tau_used", pd.Series([], dtype=float)), errors="coerce")
+    tau_series = tau_series.dropna()
+    if len(tau_series):
+        tau_used_val = float(tau_series.iloc[0])
+    else:
+        tau_used_val = float(gate_tau) if gate_tau == gate_tau else 0.0
+
+    _log(
+        "[sim] tau_used={:.4f} entries={} of {} ({:.3%}) | wins={} losses={} timeouts={} "
+        "ppv_resolved={:.3f} net_R={:.2f} avg_R={:.3f} G={:.3f}".format(
+            tau_used_val,
+            entries,
+            total_candidates,
+            decided_cov,
+            wins_dec,
+            losses_dec,
+            timeouts_dec,
+            ppv_resolved,
+            net_R,
+            avg_R_per_entry,
+            g_ratio,
+        )
+    )
+
+    coverage = decided_cov if total_candidates else (float(ev["enter"].mean()) if len(ev) else 0.0)
+    empirical_ppv = ppv_resolved if resolved_dec else float("nan")
     ppv_str = f"{empirical_ppv:.3f}" if empirical_ppv == empirical_ppv else "nan"
     _log(f"[sim] decided_cov={coverage:.3f} decided_empirical_ppv={ppv_str}")
 
     total = int(len(ev))
-    wins = int((ev["outcome"] == "win").sum())
-    losses = int((ev["outcome"] == "loss").sum())
-    timeouts = int((ev["outcome"] == "timeout").sum())
-    denom = max(wins + losses, 1)
-    wr = wins / denom if denom else 0.0
-    expR = wr * r_mult + (1.0 - wr) * (-1.0)
+    wins_all = int((ev["outcome"] == "win").sum())
+    losses_all = int((ev["outcome"] == "loss").sum())
+    timeouts_all = int((ev["outcome"] == "timeout").sum())
+    denom_all = max(wins_all + losses_all, 1)
+    wr_all = wins_all / denom_all if denom_all else 0.0
+    expR_all = wr_all * r_mult + (1.0 - wr_all) * (-1.0)
 
     trades = ev[ev["outcome"].isin(["win", "loss"])].copy()
     trades["R"] = np.where(trades["outcome"] == "win", r_mult, -1.0)
@@ -1156,18 +1195,50 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
     wins_fp_cols = ["ts", "side", "rule_id"] + [c for c in RULE_FINGERPRINT_FEATURES if c in ev.columns]
     ev.loc[ev["outcome"] == "win", wins_fp_cols].to_csv(fold_dir / "wins_fingerprints.csv", index=False)
 
-    stats = {
-        "total_events": total,
-        "wins": wins,
-        "losses": losses,
-        "timeouts": timeouts,
-        "win_rate": wr,
-        "expected_R_per_event": expR,
-        "r_mult": r_mult,
-        "gate_coverage": coverage,
-    }
-    write_json(spath, stats)
-    _log(f"[{sym}] simulate: total={total}, wr={wr:.3f}, expR={expR:.2f}, wins={wins}, losses={losses}, timeouts={timeouts}")
+    stats_existing: Dict[str, Any] = {}
+    if spath.exists():
+        try:
+            with spath.open("r", encoding="utf-8") as f:
+                stats_existing = json.load(f)
+        except Exception:
+            stats_existing = {}
+
+    stats_existing.update(
+        {
+            "total_events": total,
+            "wins_all_events": wins_all,
+            "losses_all_events": losses_all,
+            "timeouts_all_events": timeouts_all,
+            "win_rate": wr_all,
+            "expected_R_per_event": expR_all,
+            "r_mult": r_mult,
+            "gate_coverage": coverage,
+        }
+    )
+
+    stats_existing.update(
+        {
+            "tau_used": tau_used_val,
+            "entries": entries,
+            "total_candidates_scored": total_candidates,
+            "decided_coverage": decided_cov,
+            "wins": wins_dec,
+            "losses": losses_dec,
+            "timeouts": timeouts_dec,
+            "resolved": resolved_dec,
+            "ppv_resolved": ppv_resolved,
+            "R_mult": R_metric,
+            "net_R": net_R,
+            "avg_R_per_entry": avg_R_per_entry,
+            "g_ratio": g_ratio,
+        }
+    )
+
+    dump_json(stats_existing, spath)
+    _log(
+        f"[{sym}] simulate: total={total}, wr={wr_all:.3f}, expR={expR_all:.2f}, "
+        f"wins={wins_all}, losses={losses_all}, timeouts={timeouts_all}"
+    )
 
     ev_g = ev[ev["enter"]].copy()
     gated_count = int(ev_g.shape[0])
