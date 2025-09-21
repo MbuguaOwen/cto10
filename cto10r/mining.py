@@ -182,7 +182,7 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
     min_resolve_uplift_pp = float(rules_cfg.get("min_resolve_uplift_pp", 0.0))
     max_timeout_rate = rules_cfg.get("max_timeout_rate", None)
     min_resolve_frac = rules_cfg.get("min_resolve_frac", None)
-    abs_min_plcb = rules_cfg.get("min_precision_lcb", None)
+    abs_min_plcb = rules_cfg.get("abs_min_plcb", rules_cfg.get("min_precision_lcb", None))
     # loser mining knobs
     mine_losers = bool(rules_cfg.get("mine_losers", False))
     loser_top_k = int(rules_cfg.get("loser_top_k", 0))

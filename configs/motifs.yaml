@@ -95,20 +95,24 @@ mining:
   rules:
     auto_binning: true
     n_bins_cont: 5
-    min_support_frac: 0.002
-    min_months: 2
+    min_support_frac: 0.001
+    min_months: 1
+    min_wins: 5
     metric: precision_lcb
     wilson_z: 1.96
     max_terms: 2
-    top_k: 12
+    top_k: 60
+    progress: true
     precision_include_timeouts: false
     # NEW: data-relative strictness
-    min_precision_uplift_pp: 8        # require LCB >= baseline_precision + 8 percentage points
-    min_resolve_uplift_pp: 5          # require resolve_frac >= baseline_resolve + 5 pp
-    max_timeout_rate: 0.50            # drop motifs with timeout share > 50% of its own matches
-    min_resolve_frac: 0.30            # and require at least 30% of matches to resolve
+    min_precision_uplift_abs: 0.03    # +3pp absolute over baseline precision
+    min_precision_uplift_pp: 0        # disable additional pp uplift layer
+    min_lift_lcb: 1.10                # require at least 10% lift on LCB
+    min_resolve_uplift_pp: 0          # no resolve uplift requirement for now
+    max_timeout_rate: 0.90            # keep timeout filter loose while bootstrapping
+    min_resolve_frac: 0.75            # still expect most matches to resolve eventually
     # Optional absolute floors (set to null to disable)
-    min_precision_lcb: 0.58           # e.g., 0.58 if you want an absolute floor
+    abs_min_plcb: 0.22                # hard floor on precision LCB
     min_expR_lcb: null                # optional LCB on expected-R if you implement it
     # Loser mining (blocklist)
     mine_losers: true
@@ -121,14 +125,14 @@ gate:
   mode: ml
   calibration: isotonic
   target_ppv_lcb: 0.60
-  min_coverage: 0.03
+  min_coverage: 0.02
   val_months: 1
   crosses_cap: 30
 
 loser_mask:
   enabled: true
-  min_support: 40
-  min_months_with_lift: 2
+  min_support: 20
+  min_months_with_lift: 0
   min_ppv_lcb: 0.55
   save_artifact: true
 
