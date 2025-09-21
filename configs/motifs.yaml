@@ -120,7 +120,7 @@ mining:
 ml_gating:
   enabled: true
   model: logreg            # logreg | gbdt
-  target_ppv: 0.70         # precision target (validated via Wilson LCB)
+  target_ppv: 0.50         # precision target (validated via Wilson LCB)
   min_coverage_frac: 0.02  # fallback coverage if target_ppv impossible
   c_grid: [0.05, 0.1, 0.2, 0.5, 1.0]
   gbdt_grid:
