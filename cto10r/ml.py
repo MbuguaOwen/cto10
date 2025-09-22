@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import jensenshannon
+from tqdm.auto import tqdm
 
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.linear_model import LogisticRegression
@@ -893,7 +894,14 @@ def score_ml(cands_df: pd.DataFrame, fold_dir: Path, ml_cfg: dict) -> pd.Series:
     return pd.Series(p, index=cands_df.index, name="pwin")
 
 
-def schedule_non_overlapping(df: pd.DataFrame, weight_mode: str = "expR", r_mult: float = 5.0):
+def schedule_non_overlapping(
+    df: pd.DataFrame,
+    weight_mode: str = "expR",
+    r_mult: float = 5.0,
+    show_progress: bool = True,
+    progress_desc: str = "schedule",
+    update_every: int = 1000,
+):
     if "end_ts" in df.columns:
         end_ts = df["end_ts"].to_numpy()
     elif "outcome_ts" in df.columns:
@@ -913,17 +921,43 @@ def schedule_non_overlapping(df: pd.DataFrame, weight_mode: str = "expR", r_mult
     import bisect
     pidx = [bisect.bisect_right(end_ts, ts[i]) - 1 for i in range(len(ts))]
 
-    n = len(ts); dp = np.zeros(n+1, dtype=float); choose = np.zeros(n, dtype=bool)
-    for i in range(1, n+1):
-        skip = dp[i-1]
-        take = w[i-1] + (dp[pidx[i-1]+1] if pidx[i-1] >= 0 else 0.0)
-        if take > skip: dp[i]=take; choose[i-1]=True
-        else: dp[i]=skip
+    n = len(ts)
+    if update_every <= 0:
+        update_every = 1
+    dp = np.zeros(n + 1, dtype=float)
+    choose = np.zeros(n, dtype=bool)
+    for i in range(1, n + 1):
+        skip = dp[i - 1]
+        take = w[i - 1] + (dp[pidx[i - 1] + 1] if pidx[i - 1] >= 0 else 0.0)
+        if take > skip:
+            dp[i] = take
+            choose[i - 1] = True
+        else:
+            dp[i] = skip
 
-    sel = []; i = n
+    pbar = tqdm(total=n, desc=progress_desc, disable=not show_progress)
+    last_tick = 0
+
+    sel = []
+    i = n
     while i > 0:
-        if choose[i-1]: sel.append(i-1); i = pidx[i-1]+1
-        else: i -= 1
+        if choose[i - 1]:
+            sel.append(i - 1)
+            i = pidx[i - 1] + 1
+        else:
+            i -= 1
+
+        if show_progress:
+            last_tick += 1
+            if last_tick >= update_every:
+                pbar.update(last_tick)
+                last_tick = 0
+
+    if show_progress and last_tick:
+        pbar.update(last_tick)
+    if show_progress:
+        pbar.close()
+
     sel = np.array(sorted(sel))
     return df.iloc[order[sel]].copy()
 

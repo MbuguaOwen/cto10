@@ -16,6 +16,13 @@ walkforward:
   train_months: 3
   test_months: 1
   step_months: 1
+  skip_folds: [4]         # skip the outlier fold for now
+
+progress:
+  sim:
+    inner_schedule_bar: true
+    inner_desc: "schedule"
+    schedule_update_every: 1000
 
 features:
   atr_n: 14
