@@ -99,7 +99,7 @@ def _hist_by_month(s: pd.Series, edges: np.ndarray, months: pd.Series) -> Dict[s
     if len(s) == 0:
         return res
     months = months.reindex(s.index)
-    for m, sub in s.groupby(months):
+    for m, sub in s.groupby(months, observed=False):
         sub = pd.to_numeric(sub, errors="coerce").dropna()
         if len(sub) == 0:
             continue
@@ -261,7 +261,7 @@ def _choose_bins_for_feature(
         if PREF_MONO and len(np.unique(idx_fit)) > 1:
             means = (
                 pd.DataFrame({"bin": idx_fit, "y": y_fit})
-                .groupby("bin")["y"]
+                .groupby("bin", observed=False)["y"]
                 .mean()
                 .fillna(0.0)
                 .to_numpy()
