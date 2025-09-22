@@ -272,7 +272,7 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
 
         months_with_lift = 0
         if "ym" in sub.columns:
-            bym = sub.groupby("ym").agg(
+            bym = sub.groupby("ym", observed=False, sort=False).agg(
                 n=("is_win", "size"),
                 win=("is_win", "sum"),
                 loss=("is_loss", "sum"),
