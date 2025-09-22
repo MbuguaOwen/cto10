@@ -39,7 +39,7 @@ from tqdm.auto import tqdm
 from .io_utils import ensure_dir, write_json, skip_if_exists
 
 
-from .util import exception_to_report, infer_bar_seconds, safe_div, dump_json
+from .util import exception_to_report, infer_bar_seconds, safe_div, dump_json, wilson_lcb
 
 
 from .bars import load_bars_any, build_features, fit_percentiles, apply_percentiles, add_age_features, add_nonlinear_features
@@ -988,22 +988,18 @@ def stage_mining(sym: str, train_months: List[str], test_months: List[str], cfg:
         _log(f"[{sym}] gate: insufficient labeled data for training (rows={len(train_core)})")
 
 
-def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cfg: Dict[str, Any], fold_dir: Path, force: bool) -> None:
+def stage_simulate(
+    sym: str,
+    train_months: List[str],
+    test_months: List[str],
+    cfg: Dict[str, Any],
+    fold_dir: Path,
+    force: bool,
+    fold_idx: Optional[int] = None,
+) -> None:
 
 
     _log(f"[{sym}] simulate: start test={test_months}")
-
-
-    prog_cfg = (cfg.get("progress", {}) or {}).get("sim", {}) or {}
-    show_inner = bool(prog_cfg.get("inner_schedule_bar", False))
-    desc_inner = str(prog_cfg.get("schedule_desc", "schedule"))
-    upd_every = int(prog_cfg.get("schedule_update_every", 1000))
-
-    sched_cfg = (cfg.get("execution_sim", {}) or {}).get("scheduler", {}) or {}
-    weight_mode = str(sched_cfg.get("weight_mode", "expR"))
-    sched_r_mult = float(sched_cfg.get("r_mult", 5.0))
-    timeout_sec = sched_cfg.get("timeout_sec", None)
-    timeout_sec = float(timeout_sec) if timeout_sec is not None else None
 
 
     spath = fold_dir / "stats.json"
@@ -1303,29 +1299,131 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
     ev_g = ev[ev["enter"]].copy()
     gated_count = int(ev_g.shape[0])
 
+    # ---- progress + scheduler cfg ----
+    prog_cfg = (cfg.get("progress", {}) or {}).get("sim", {}) or {}
+    show_inner = bool(prog_cfg.get("inner_schedule_bar", False))
+    desc_inner = str(prog_cfg.get("schedule_desc", "schedule"))
+    upd_every = int(prog_cfg.get("schedule_update_every", 1000))
+
+    sched_cfg = (cfg.get("execution_sim", {}) or {}).get("scheduler", {}) or {}
+    weight_mode = str(sched_cfg.get("weight_mode", "expR"))
+    sched_r_mult = float(sched_cfg.get("r_mult", 5.0))
+    timeout_sec = sched_cfg.get("timeout_sec", None)
+    timeout_sec = float(timeout_sec) if timeout_sec is not None else None
+
+    # pre-schedule snapshot to guarantee downstream artifacts exist
     ev_g.to_csv(fold_dir / "trades_gated_presched.csv", index=False)
 
-    if bool(sched_cfg.get("enabled", True)):
-        try:
-            take_sched = schedule_non_overlapping(
-                ev_g,
-                weight_mode=weight_mode,
-                r_mult=sched_r_mult,
-                show_progress=show_inner,
-                progress_desc=desc_inner,
-                update_every=upd_every,
-                timeout_sec=timeout_sec,
-            )
-            scheduler_fallback = False
-        except Exception as exc:
-            _log(f"[{sym}] schedule_non_overlapping fallback: {exc}")
-            take_sched = ev_g.copy()
-            scheduler_fallback = True
+    if fold_idx is not None and len(test_months):
+        progress_label = f"{desc_inner} [{sym}|Fold {fold_idx}|test={test_months[0]}]"
+    elif fold_idx is not None:
+        progress_label = f"{desc_inner} [{sym}|Fold {fold_idx}]"
+    elif len(test_months):
+        progress_label = f"{desc_inner} [{sym}|test={test_months[0]}]"
     else:
-        take_sched = ev_g.copy()
-        scheduler_fallback = False
+        progress_label = f"{desc_inner} [{sym}]"
 
+    try:
+        take_sched = schedule_non_overlapping(
+            ev_g,
+            weight_mode=weight_mode,
+            r_mult=sched_r_mult,
+            show_progress=show_inner,
+            progress_desc=progress_label,
+            update_every=upd_every,
+            timeout_sec=timeout_sec,
+        )
+        scheduler_fallback = False
+    except Exception as _e:
+        _log(f"[{sym}] schedule_non_overlapping fallback: {_e}")
+        take_sched = ev_g.copy()
+        scheduler_fallback = True
+
+    # canonical scheduled trades
     take_sched.to_csv(fold_dir / "trades_gated.csv", index=False)
+
+    tw = (cfg.get("tripwires", {}) or {})
+    ppv_lcb_min = float(tw.get("ppv_lcb_min", 0.50))
+    timeout_rate_max = float(tw.get("timeout_rate_max", 0.60))
+    window_days = int(tw.get("window_days", 3))
+    fallback_days_max = int(tw.get("fallback_days_max", 3))
+
+    tg = take_sched.copy()
+    if "ts" in tg.columns:
+        tscol = "ts"
+        tg["_date"] = pd.to_datetime(tg[tscol], unit="s", errors="coerce").dt.date
+    else:
+        tg["_date"] = pd.NaT
+
+    is_win = tg.get("is_win")
+    is_loss = tg.get("is_loss")
+    is_to = tg.get("is_to")
+    if is_win is None or is_loss is None:
+        oc = tg.get("outcome")
+        if oc is not None:
+            oc = oc.fillna("")
+            is_win = (oc == "win").astype(int)
+            is_loss = (oc == "loss").astype(int)
+            if "timeout" in set(oc.unique()):
+                is_to = (oc == "timeout").astype(int)
+            else:
+                is_to = pd.Series([0] * len(tg), index=tg.index, dtype=int)
+        else:
+            zeros = pd.Series([0] * len(tg), index=tg.index, dtype=int)
+            is_win = zeros.copy()
+            is_loss = zeros.copy()
+            is_to = zeros.copy()
+
+    if not isinstance(is_win, pd.Series):
+        is_win = pd.Series(is_win, index=tg.index)
+    if not isinstance(is_loss, pd.Series):
+        is_loss = pd.Series(is_loss, index=tg.index)
+    if not isinstance(is_to, pd.Series):
+        is_to = pd.Series(is_to, index=tg.index)
+
+    tg["is_win"] = pd.to_numeric(is_win, errors="coerce").fillna(0).astype(int)
+    tg["is_loss"] = pd.to_numeric(is_loss, errors="coerce").fillna(0).astype(int)
+    tg["is_to"] = pd.to_numeric(is_to, errors="coerce").fillna(0).astype(int)
+
+    daily = tg.groupby("_date").agg(
+        wins=("is_win", "sum") if "is_win" in tg.columns else ("_date", "size"),
+        losses=("is_loss", "sum") if "is_loss" in tg.columns else ("_date", "size"),
+        timeouts=("is_to", "sum") if "is_to" in tg.columns else ("_date", "size"),
+        scheduled=("_date", "size"),
+    ).reset_index()
+
+    daily["wins_roll"] = daily["wins"].rolling(window_days, min_periods=1).sum()
+    daily["losses_roll"] = daily["losses"].rolling(window_days, min_periods=1).sum()
+    daily["resolved_roll"] = daily["wins_roll"] + daily["losses_roll"]
+    daily["ppv_lcb_roll"] = daily.apply(
+        lambda r: wilson_lcb(int(r["wins_roll"]), int(r["resolved_roll"])) if r["resolved_roll"] > 0 else 0.0,
+        axis=1,
+    )
+    daily["timeout_rate_roll"] = (
+        daily["timeouts"].rolling(window_days, min_periods=1).sum()
+        / daily["scheduled"].rolling(window_days, min_periods=1).sum().clip(lower=1)
+    )
+
+    ppv_breach_days = [str(d) for d, v in zip(daily["_date"], daily["ppv_lcb_roll"]) if v < ppv_lcb_min]
+    to_breach_days = [str(d) for d, v in zip(daily["_date"], daily["timeout_rate_roll"]) if v > timeout_rate_max]
+
+    tripwire = {
+        "ppv_lcb_min": ppv_lcb_min,
+        "timeout_rate_max": timeout_rate_max,
+        "window_days": window_days,
+        "fallback_days_max": fallback_days_max,
+        "ppv_lcb_roll_min": float(daily["ppv_lcb_roll"].min() if len(daily) else 0.0),
+        "timeout_rate_roll_max": float(daily["timeout_rate_roll"].max() if len(daily) else 0.0),
+        "ppv_breach_days": ppv_breach_days,
+        "timeout_breach_days": to_breach_days,
+        "scheduler_fallback_used": bool(scheduler_fallback),
+    }
+
+    with open(fold_dir / "tripwire_status.json", "w") as fh:
+        json.dump(tripwire, fh, indent=2)
+
+    if ppv_breach_days or to_breach_days:
+        _log(f"[{sym}] TRIPWIRE breach: {tripwire}")
 
     _log(f"[SIM] coverage={coverage:.3f} selected={gated_count} scheduled={len(take_sched)}")
 
@@ -1524,7 +1622,7 @@ def run_walkforward(cfg_path: str, force: bool, clean: bool, only: Optional[str]
                 try:
 
 
-                    stage_simulate(sym, tr_m, te_m, cfg, fold_dir, force)
+                    stage_simulate(sym, tr_m, te_m, cfg, fold_dir, force, fold_idx=i)
 
 
                 except Exception as e:

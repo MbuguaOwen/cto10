@@ -2,6 +2,7 @@ io:
   outputs_root: outputs
   progress: true
 
+# ---- Limit to folds 0–1 only (Jan–May → tests Apr, May) ----
 data:
   symbols: [BTCUSDT]
   bars_dir: inputs/bars_1m
@@ -10,14 +11,16 @@ data:
   file_patterns:
     bars: "{SYMBOL}/{SYMBOL}-1m-{YYYY}-{MM}.csv"
     ticks: "{SYMBOL}/{SYMBOL}-ticks-{YYYY}-{MM}.csv"   # auto-detect parquet too
-  months: { start: "2025-01", end: "2025-08" }
+  months: { start: "2025-01", end: "2025-05" }
 
 walkforward:
   train_months: 3
   test_months: 1
   step_months: 1
-  skip_folds: [4]          # exclude the unstable fold for now
+  skip_folds: []            # leave empty; with Jan–May you'll naturally get 2 folds
+  # If you want to run all months but skip unstable folds, set skip_folds: [2,3,4] instead of shrinking months.
 
+# ---- Sim progress + scheduler settings ----
 progress:
   sim:
     inner_schedule_bar: true
@@ -26,9 +29,16 @@ progress:
 
 execution_sim:
   scheduler:
-    weight_mode: "expR"
-    r_mult: 5.0
-    timeout_sec: 60        # hard cap; fall back gracefully
+    weight_mode: "expR"     # precision-first scheduling (if pwin/score exists)
+    r_mult: 5.0             # used when weight_mode="expR"
+    timeout_sec: 60         # DP timeout → deterministic greedy fallback
+    
+# ---- Tripwires to auto-flag bad behavior in sim outputs ----
+tripwires:
+  ppv_lcb_min: 0.50         # rolling 3-day Wilson LCB must stay ≥ this
+  window_days: 3
+  timeout_rate_max: 0.60    # rolling 3-day timeout share must stay ≤ this
+  fallback_days_max: 3      # informational (we track if fallback happens)
 
 features:
   atr_n: 14
@@ -134,11 +144,13 @@ mining:
     loser_min_resolve_frac: 0.40
     loser_min_months: 2
 
+# ---- Guardrails for high-precision gating ----
 gate:
   mode: ml
   calibration: isotonic
-  target_ppv_lcb: 0.60
-  min_coverage: 0.02
+  target_ppv_lcb: 0.58      # keep your ~0.60 standard, allows small slack
+  min_coverage: 0.00        # never force coverage up
+  tau_floor: 0.42           # prevents τ collapse (like fold 4)
   val_months: 1
   crosses_cap: 30
 

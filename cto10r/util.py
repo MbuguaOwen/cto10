@@ -343,3 +343,13 @@ def rolling_high(x: pd.Series, n: int) -> pd.Series:
 
 def rolling_low(x: pd.Series, n: int) -> pd.Series:
     return pd.to_numeric(x, errors="coerce").rolling(n, min_periods=1).min()
+
+
+def wilson_lcb(wins: int, n: int, z: float = 1.96) -> float:
+    if n <= 0:
+        return 0.0
+    p = wins / n
+    denom = 1.0 + (z * z) / n
+    centre = p + (z * z) / (2 * n)
+    rad = z * ((p * (1.0 - p) + (z * z) / (4 * n)) / n) ** 0.5
+    return max(0.0, (centre - rad) / denom)
