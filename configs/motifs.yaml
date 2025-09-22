@@ -96,7 +96,7 @@ labels:
   horizon_hours: 72
   quick_ignition_hours: 2
   non_overlap: true
-  eta_atr: 0.30
+  eta_atr: 20.0
   eta_by_atr_p: []        # optional TRAIN regime map (kept empty by default)
   eta_cap: { min: 0.10, max: 5.00 }
   stop_band_atr: 0.05
