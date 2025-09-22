@@ -133,6 +133,20 @@ All timeouts in high vol: enable time scaling (time_scale_from_eta) or increase 
 
 Tick crashes on timestamps: CSV row with bad ts is skipped; Parquet path coerces units. If a month still shows zero ticks, confirm files and month ranges.
 
+Leakage sanity checks
+
+python leakage_helpers.py permute --fold 0
+  Shuffles train labels for fold 0 (writes events_train.perm_bak.csv backup). Re-run mining+simulate for that fold; gated PPV should crash to baseline.
+
+python leakage_helpers.py shift --fold 0 --steps 1
+  Time-shifts train labels forward by one row (backup: events_train.shift_bak.csv). Re-mine and simulate; PPV should again fall to baseline.
+
+python leakage_helpers.py simulate-twice --config configs/motifs_f0.yaml
+  Runs walkforward simulate twice back-to-back with the same config. Scheduled counts/outcomes should match exactly between runs.
+
+python leakage_helpers.py bh --folds 0 1 --alpha 0.10
+  Quick Benjamini–Hochberg filter using 1 - precision_lcb as a faux p-value.
+
 Determinism & deps
 
 Seed: seed: 42 (set in YAML).
