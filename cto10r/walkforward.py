@@ -994,6 +994,12 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
     _log(f"[{sym}] simulate: start test={test_months}")
 
 
+    prog_cfg = (cfg.get("progress") or {}).get("sim", {})
+    show_inner = bool(prog_cfg.get("inner_schedule_bar", True))
+    desc_inner = str(prog_cfg.get("inner_desc", "schedule"))
+    upd_every = int(prog_cfg.get("schedule_update_every", 1000))
+
+
     spath = fold_dir / "stats.json"
 
 
@@ -1297,6 +1303,9 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
             ev_g,
             weight_mode=str(sched_cfg.get("weight", "expR")).lower(),
             r_mult=r_mult,
+            show_progress=show_inner,
+            progress_desc=desc_inner,
+            update_every=upd_every,
         )
     else:
         take_sched = ev_g
@@ -1387,6 +1396,9 @@ def run_walkforward(cfg_path: str, force: bool, clean: bool, only: Optional[str]
     progress_on = bool(cfg.get("io", {}).get("progress", True))
 
 
+    skip_set = set((cfg.get("walkforward") or {}).get("skip_folds", []))
+
+
     for sym in symbols:
 
 
@@ -1394,6 +1406,15 @@ def run_walkforward(cfg_path: str, force: bool, clean: bool, only: Optional[str]
 
 
         for i, (tr_m, te_m) in fold_iter:
+
+
+            if i in skip_set:
+
+
+                _log(f"[{sym}] SKIP fold {i} (per config)")
+
+
+                continue
 
 
             fold_dir = out_root / sym / f"fold_{i}"
