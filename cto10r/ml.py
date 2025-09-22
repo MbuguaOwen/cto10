@@ -905,14 +905,17 @@ def schedule_non_overlapping(
     timeout_sec: Optional[float] = None,
 ) -> pd.DataFrame:
     """
-    Weighted non-overlapping interval selection.
-    - Weights: expR (= r_mult * pwin - (1 - pwin)) or plain pwin
-    - Progress bar shows the *true* number of backtrack steps (<= n)
-    - Optional timeout; on hit, greedy fallback (by end_ts then weight)
+    Weighted non-overlapping interval selection (interval scheduling):
+      - If weight_mode == "expR": weight = r_mult*pwin - (1-pwin)
+      - If weight_mode in {"pwin","score"} and such column exists: use that column directly
+      - Otherwise, weights default to 1.0 (uniform)
+    Progress bar uses true, bounded totals; timeout triggers a deterministic greedy fallback.
+    Always returns a scheduled subset of the *gated* input df.
     """
     if len(df) == 0:
         return df.copy()
 
+    # require ts and end_ts/outcome_ts
     if "ts" not in df.columns:
         return df.copy()
     if "end_ts" in df.columns:
@@ -927,16 +930,23 @@ def schedule_non_overlapping(
     ts = ts[order]
     end_ts = end_ts[order]
 
-    if "pwin" in df.columns:
-        p = (
-            pd.to_numeric(df["pwin"], errors="coerce")
-            .fillna(0.0)
-            .to_numpy()[order]
-        )
+    # compute weights
+    if weight_mode in ("pwin", "score"):
+        col = "pwin" if "pwin" in df.columns else ("score" if "score" in df.columns else None)
+        if col is not None:
+            w = pd.to_numeric(df[col], errors="coerce").fillna(0.0).to_numpy()[order]
+        else:
+            w = np.ones_like(ts, dtype=float)
+    elif weight_mode == "expR":
+        if "pwin" in df.columns:
+            p = pd.to_numeric(df["pwin"], errors="coerce").fillna(0.0).to_numpy()[order]
+        else:
+            p = np.ones_like(ts, dtype=float)
+        w = (float(r_mult) * p) - (1.0 - p)
     else:
-        p = np.ones_like(ts, dtype=float)
-    w = (float(r_mult) * p - (1.0 - p)) if weight_mode == "expR" else p
+        w = np.ones_like(ts, dtype=float)
 
+    # rightmost compatible index for each i: end_ts[j] <= ts[i]
     import bisect
 
     pidx = [bisect.bisect_right(end_ts, ts[i]) - 1 for i in range(len(ts))]
@@ -947,6 +957,7 @@ def schedule_non_overlapping(
     start = time.time()
 
     try:
+        # DP forward
         dp = np.zeros(n + 1, dtype=float)
         choose = np.zeros(n, dtype=bool)
         for i in range(1, n + 1):
@@ -957,14 +968,13 @@ def schedule_non_overlapping(
                 choose[i - 1] = True
             else:
                 dp[i] = skip
-
             if timeout_sec and (time.time() - start) > timeout_sec:
                 raise TimeoutError("schedule timeout")
 
+        # Backtrack with bounded progress
         pbar = tqdm(total=n, desc=progress_desc, disable=not show_progress)
         last_tick = 0
-
-        sel: List[int] = []
+        sel = []
         i = n
         while i > 0:
             if choose[i - 1]:
@@ -972,55 +982,44 @@ def schedule_non_overlapping(
                 i = pidx[i - 1] + 1
             else:
                 i -= 1
-
             if show_progress:
                 last_tick += 1
                 if last_tick >= update_every:
                     pbar.update(last_tick)
                     last_tick = 0
-
-        if show_progress and last_tick:
-            pbar.update(last_tick)
-        pbar.close()
+        if show_progress:
+            if last_tick:
+                pbar.update(last_tick)
+            pbar.close()
 
         sel = np.array(sorted(sel))
         return df.iloc[order[sel]].copy()
 
-    except (KeyboardInterrupt, TimeoutError):
-        pbar = tqdm(total=n, desc=f"{progress_desc}[greedy]", disable=not show_progress)
-        last_tick = 0
-        selected: List[int] = []
-        for idx in range(n):
-            if show_progress:
-                last_tick += 1
-                if last_tick >= update_every:
-                    pbar.update(last_tick)
-                    last_tick = 0
-
-            if not np.isfinite(ts[idx]) or not np.isfinite(end_ts[idx]):
-                continue
-
-            if not selected:
-                selected.append(idx)
-                continue
-
-            last_idx = selected[-1]
-            if ts[idx] >= end_ts[last_idx]:
-                selected.append(idx)
-                continue
-
-            prev_end = end_ts[selected[-2]] if len(selected) >= 2 else -np.inf
-            if w[idx] > w[last_idx] and ts[idx] >= prev_end:
-                selected[-1] = idx
-
-        if show_progress and last_tick:
-            pbar.update(last_tick)
-        pbar.close()
+    except (KeyboardInterrupt, TimeoutError, MemoryError):
+        # Greedy deterministic fallback by (end_ts asc, weight desc) with accurate progress
+        idx = np.lexsort((-w, end_ts))
+        end_ts_sorted = end_ts[idx]
+        ts_sorted = ts[idx]
 
         keep = np.zeros(n, dtype=bool)
-        if selected:
-            keep[np.array(selected, dtype=int)] = True
-        return df.iloc[order[keep]].copy()
+        last_end = -np.inf
+        pbar = tqdm(total=n, desc=f"{progress_desc}[greedy]", disable=not show_progress)
+        tick = 0
+        for k in range(n):
+            i = idx[k]
+            if ts_sorted[k] >= last_end:
+                keep[i] = True
+                last_end = end_ts_sorted[k]
+            tick += 1
+            if show_progress and (tick % update_every == 0):
+                pbar.update(update_every)
+        if show_progress:
+            if tick % update_every:
+                pbar.update(tick % update_every)
+            pbar.close()
+
+        sel = np.flatnonzero(keep)
+        return df.iloc[order[sel]].copy()
 
 
 def _extract_y(df: pd.DataFrame) -> np.ndarray:
