@@ -95,13 +95,13 @@ mining:
   rules:
     auto_binning: true
     n_bins_cont: 5
-    min_support_frac: 0.001
+    min_support_frac: 0.0015
     min_months: 1
     min_wins: 5
     metric: precision_lcb
     wilson_z: 1.96
-    max_terms: 2
-    top_k: 60
+    max_terms: 1
+    top_k: 25
     progress: true
     precision_include_timeouts: false
     # NEW: data-relative strictness
@@ -124,9 +124,10 @@ mining:
 gate:
   mode: ml
   calibration: isotonic
-  target_ppv_lcb: 0.60
-  min_coverage: 0.02
-  val_months: 1
+  target_ppv_lcb: 0.58
+  min_coverage: 0.00
+  val_months: 2
+  tau_floor: 0.35
   crosses_cap: 30
 
 loser_mask:
@@ -166,7 +167,7 @@ ml_gating:
     prefer_monotone: true
   # ----- new: curated crosses -----
   crosses:
-    use_motif_crosses: true           # keep existing data-driven crosses
+    use_motif_crosses: false          # disable data-driven crosses for now
     enable_curated: true
     max_total: 30                     # hard cap (includes motif crosses actually kept)
     top_k_literals_from_winners: 20   # for motif-driven crosses
