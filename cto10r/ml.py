@@ -1,8 +1,9 @@
 import json
 import math
+import time
 import warnings
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -901,65 +902,125 @@ def schedule_non_overlapping(
     show_progress: bool = True,
     progress_desc: str = "schedule",
     update_every: int = 1000,
-):
-    if "end_ts" in df.columns:
-        end_ts = df["end_ts"].to_numpy()
-    elif "outcome_ts" in df.columns:
-        end_ts = df["outcome_ts"].to_numpy()
-    else:
-        return df
+    timeout_sec: Optional[float] = None,
+) -> pd.DataFrame:
+    """
+    Weighted non-overlapping interval selection.
+    - Weights: expR (= r_mult * pwin - (1 - pwin)) or plain pwin
+    - Progress bar shows the *true* number of backtrack steps (<= n)
+    - Optional timeout; on hit, greedy fallback (by end_ts then weight)
+    """
+    if len(df) == 0:
+        return df.copy()
 
-    ts = df["ts"].to_numpy()
+    if "ts" not in df.columns:
+        return df.copy()
+    if "end_ts" in df.columns:
+        end_ts = pd.to_numeric(df["end_ts"], errors="coerce").to_numpy()
+    elif "outcome_ts" in df.columns:
+        end_ts = pd.to_numeric(df["outcome_ts"], errors="coerce").to_numpy()
+    else:
+        return df.copy()
+
+    ts = pd.to_numeric(df["ts"], errors="coerce").to_numpy()
     order = np.argsort(end_ts, kind="mergesort")
-    ts, end_ts = ts[order], end_ts[order]
+    ts = ts[order]
+    end_ts = end_ts[order]
+
     if "pwin" in df.columns:
-        p = df["pwin"].to_numpy()[order]
+        p = (
+            pd.to_numeric(df["pwin"], errors="coerce")
+            .fillna(0.0)
+            .to_numpy()[order]
+        )
     else:
         p = np.ones_like(ts, dtype=float)
-    w = (float(r_mult)*p - (1.0-p)) if weight_mode == "expR" else p
+    w = (float(r_mult) * p - (1.0 - p)) if weight_mode == "expR" else p
 
     import bisect
+
     pidx = [bisect.bisect_right(end_ts, ts[i]) - 1 for i in range(len(ts))]
-
     n = len(ts)
-    if update_every <= 0:
-        update_every = 1
-    dp = np.zeros(n + 1, dtype=float)
-    choose = np.zeros(n, dtype=bool)
-    for i in range(1, n + 1):
-        skip = dp[i - 1]
-        take = w[i - 1] + (dp[pidx[i - 1] + 1] if pidx[i - 1] >= 0 else 0.0)
-        if take > skip:
-            dp[i] = take
-            choose[i - 1] = True
-        else:
-            dp[i] = skip
+    if update_every is None or update_every <= 0:
+        update_every = 1000
 
-    pbar = tqdm(total=n, desc=progress_desc, disable=not show_progress)
-    last_tick = 0
+    start = time.time()
 
-    sel = []
-    i = n
-    while i > 0:
-        if choose[i - 1]:
-            sel.append(i - 1)
-            i = pidx[i - 1] + 1
-        else:
-            i -= 1
+    try:
+        dp = np.zeros(n + 1, dtype=float)
+        choose = np.zeros(n, dtype=bool)
+        for i in range(1, n + 1):
+            skip = dp[i - 1]
+            take = w[i - 1] + (dp[pidx[i - 1] + 1] if pidx[i - 1] >= 0 else 0.0)
+            if take > skip:
+                dp[i] = take
+                choose[i - 1] = True
+            else:
+                dp[i] = skip
 
-        if show_progress:
-            last_tick += 1
-            if last_tick >= update_every:
-                pbar.update(last_tick)
-                last_tick = 0
+            if timeout_sec and (time.time() - start) > timeout_sec:
+                raise TimeoutError("schedule timeout")
 
-    if show_progress and last_tick:
-        pbar.update(last_tick)
-    if show_progress:
+        pbar = tqdm(total=n, desc=progress_desc, disable=not show_progress)
+        last_tick = 0
+
+        sel: List[int] = []
+        i = n
+        while i > 0:
+            if choose[i - 1]:
+                sel.append(i - 1)
+                i = pidx[i - 1] + 1
+            else:
+                i -= 1
+
+            if show_progress:
+                last_tick += 1
+                if last_tick >= update_every:
+                    pbar.update(last_tick)
+                    last_tick = 0
+
+        if show_progress and last_tick:
+            pbar.update(last_tick)
         pbar.close()
 
-    sel = np.array(sorted(sel))
-    return df.iloc[order[sel]].copy()
+        sel = np.array(sorted(sel))
+        return df.iloc[order[sel]].copy()
+
+    except (KeyboardInterrupt, TimeoutError):
+        pbar = tqdm(total=n, desc=f"{progress_desc}[greedy]", disable=not show_progress)
+        last_tick = 0
+        selected: List[int] = []
+        for idx in range(n):
+            if show_progress:
+                last_tick += 1
+                if last_tick >= update_every:
+                    pbar.update(last_tick)
+                    last_tick = 0
+
+            if not np.isfinite(ts[idx]) or not np.isfinite(end_ts[idx]):
+                continue
+
+            if not selected:
+                selected.append(idx)
+                continue
+
+            last_idx = selected[-1]
+            if ts[idx] >= end_ts[last_idx]:
+                selected.append(idx)
+                continue
+
+            prev_end = end_ts[selected[-2]] if len(selected) >= 2 else -np.inf
+            if w[idx] > w[last_idx] and ts[idx] >= prev_end:
+                selected[-1] = idx
+
+        if show_progress and last_tick:
+            pbar.update(last_tick)
+        pbar.close()
+
+        keep = np.zeros(n, dtype=bool)
+        if selected:
+            keep[np.array(selected, dtype=int)] = True
+        return df.iloc[order[keep]].copy()
 
 
 def _extract_y(df: pd.DataFrame) -> np.ndarray:

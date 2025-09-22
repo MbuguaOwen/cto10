@@ -16,13 +16,19 @@ walkforward:
   train_months: 3
   test_months: 1
   step_months: 1
-  skip_folds: [4]         # skip the outlier fold for now
+  skip_folds: [4]          # exclude the unstable fold for now
 
 progress:
   sim:
     inner_schedule_bar: true
-    inner_desc: "schedule"
+    schedule_desc: "schedule"
     schedule_update_every: 1000
+
+execution_sim:
+  scheduler:
+    weight_mode: "expR"
+    r_mult: 5.0
+    timeout_sec: 60        # hard cap; fall back gracefully
 
 features:
   atr_n: 14

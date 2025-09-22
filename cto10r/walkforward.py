@@ -994,10 +994,16 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
     _log(f"[{sym}] simulate: start test={test_months}")
 
 
-    prog_cfg = (cfg.get("progress") or {}).get("sim", {})
-    show_inner = bool(prog_cfg.get("inner_schedule_bar", True))
-    desc_inner = str(prog_cfg.get("inner_desc", "schedule"))
+    prog_cfg = (cfg.get("progress", {}) or {}).get("sim", {}) or {}
+    show_inner = bool(prog_cfg.get("inner_schedule_bar", False))
+    desc_inner = str(prog_cfg.get("schedule_desc", "schedule"))
     upd_every = int(prog_cfg.get("schedule_update_every", 1000))
+
+    sched_cfg = (cfg.get("execution_sim", {}) or {}).get("scheduler", {}) or {}
+    weight_mode = str(sched_cfg.get("weight_mode", "expR"))
+    sched_r_mult = float(sched_cfg.get("r_mult", 5.0))
+    timeout_sec = sched_cfg.get("timeout_sec", None)
+    timeout_sec = float(timeout_sec) if timeout_sec is not None else None
 
 
     spath = fold_dir / "stats.json"
@@ -1034,7 +1040,7 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
 
 
     labels_cfg_sim = cfg.get("labels", {}) or {}
-    r_mult = float(labels_cfg_sim.get("r_mult", 5.0))
+    label_r_mult = float(labels_cfg_sim.get("r_mult", 5.0))
 
 
     join_cols = ["ts", "side", "entry", "level", "risk_dist"]
@@ -1178,7 +1184,7 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
     else:
         tau_used_val = float(gate_tau) if gate_tau == gate_tau else float(getattr(gate, "tau", 0.0))
 
-    R_metric = float(cfg.get("labels", {}).get("r_mult", 5))
+    R_metric = label_r_mult
     dec = decision_df.loc[decision_df["enter"]]
     entries = int(len(dec))
     wins = int((dec["label"] == 1).sum())
@@ -1254,10 +1260,10 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
     timeouts_all = int((ev["outcome"] == "timeout").sum())
     denom_all = max(wins_all + losses_all, 1)
     wr_all = wins_all / denom_all if denom_all else 0.0
-    expR_all = wr_all * r_mult + (1.0 - wr_all) * (-1.0)
+    expR_all = wr_all * label_r_mult + (1.0 - wr_all) * (-1.0)
 
     trades = ev[ev["outcome"].isin(["win", "loss"])].copy()
-    trades["R"] = np.where(trades["outcome"] == "win", r_mult, -1.0)
+    trades["R"] = np.where(trades["outcome"] == "win", label_r_mult, -1.0)
     trades.to_csv(tpath, index=False)
 
     cands_t_norm.to_csv(trpath, index=False)
@@ -1281,7 +1287,7 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
             "timeouts_all_events": timeouts_all,
             "win_rate": wr_all,
             "expected_R_per_event": expR_all,
-            "r_mult": r_mult,
+            "r_mult": label_r_mult,
             "gate_coverage": coverage,
         }
     )
@@ -1297,37 +1303,54 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
     ev_g = ev[ev["enter"]].copy()
     gated_count = int(ev_g.shape[0])
 
-    sched_cfg = cfg.get("execution_sim", {}).get("scheduler", {"enabled": True, "weight": "expR"})
+    ev_g.to_csv(fold_dir / "trades_gated_presched.csv", index=False)
+
     if bool(sched_cfg.get("enabled", True)):
-        take_sched = schedule_non_overlapping(
-            ev_g,
-            weight_mode=str(sched_cfg.get("weight", "expR")).lower(),
-            r_mult=r_mult,
-            show_progress=show_inner,
-            progress_desc=desc_inner,
-            update_every=upd_every,
-        )
+        try:
+            take_sched = schedule_non_overlapping(
+                ev_g,
+                weight_mode=weight_mode,
+                r_mult=sched_r_mult,
+                show_progress=show_inner,
+                progress_desc=desc_inner,
+                update_every=upd_every,
+                timeout_sec=timeout_sec,
+            )
+            scheduler_fallback = False
+        except Exception as exc:
+            _log(f"[{sym}] schedule_non_overlapping fallback: {exc}")
+            take_sched = ev_g.copy()
+            scheduler_fallback = True
     else:
-        take_sched = ev_g
+        take_sched = ev_g.copy()
+        scheduler_fallback = False
+
+    take_sched.to_csv(fold_dir / "trades_gated.csv", index=False)
 
     _log(f"[SIM] coverage={coverage:.3f} selected={gated_count} scheduled={len(take_sched)}")
 
-    g_wins = int((take_sched["outcome"] == "win").sum())
-    g_losses = int((take_sched["outcome"] == "loss").sum())
-    g_timeouts = int((take_sched["outcome"] == "timeout").sum())
+    outcome_series = take_sched.get("outcome")
+    if outcome_series is None:
+        outcome_series = pd.Series(np.full(len(take_sched), "", dtype=object), index=take_sched.index)
+    g_wins = int((outcome_series == "win").sum())
+    g_losses = int((outcome_series == "loss").sum())
+    g_timeouts = int((outcome_series == "timeout").sum())
     g_denom = max(g_wins + g_losses, 1)
     g_wr = g_wins / g_denom if g_denom else 0.0
-    g_expR = g_wr * r_mult + (1.0 - g_wr) * (-1.0)
-
-    trades_g = take_sched[take_sched["outcome"].isin(["win", "loss"])].copy()
-    trades_g["R"] = np.where(trades_g["outcome"] == "win", r_mult, -1.0)
-    trades_g.to_csv(fold_dir / "trades_gated.csv", index=False)
+    g_expR = g_wr * label_r_mult + (1.0 - g_wr) * (-1.0)
 
     wins_fp_cols_g = ["ts", "side"] + [c for c in RULE_FINGERPRINT_FEATURES if c in take_sched.columns]
-    take_sched.loc[take_sched["outcome"] == "win", wins_fp_cols_g].to_csv(
+    take_sched.loc[outcome_series == "win", wins_fp_cols_g].to_csv(
         fold_dir / "wins_fingerprints_gated.csv",
         index=False,
     )
+
+    expR_series = take_sched.get("expR", pd.Series([], dtype=float))
+    expR_series = pd.to_numeric(expR_series, errors="coerce") if isinstance(expR_series, pd.Series) else pd.Series(expR_series)
+    expected_R_per_event = float(expR_series.fillna(0.0).mean()) if len(expR_series) else 0.0
+    outcome_non_empty = outcome_series.dropna()
+    outcome_non_empty = outcome_non_empty[outcome_non_empty != ""]
+    denom_outcomes = max(1, int(len(outcome_non_empty)))
 
     write_json(
         fold_dir / "stats_gated.json",
@@ -1336,13 +1359,17 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
             "wins": g_wins,
             "losses": g_losses,
             "timeouts": g_timeouts,
-            "win_rate": g_wr,
-            "expected_R_per_event": g_expR,
-            "r_mult": r_mult,
+            "win_rate": float(g_wins / denom_outcomes) if denom_outcomes else 0.0,
+            "expected_R_per_event": expected_R_per_event,
+            "r_mult": sched_r_mult,
+            "scheduler_fallback": scheduler_fallback,
         },
     )
 
-    _log(f"[{sym}] simulate[GATED]: kept={len(ev_g)} scheduled={len(take_sched)} wr={g_wr:.3f} expR={g_expR:.2f}")
+    _log(
+        f"[{sym}] simulate[GATED]: kept={len(ev_g)} scheduled={len(take_sched)} wr={g_wr:.3f} expR={g_expR:.2f}"
+        + (" [fallback]" if scheduler_fallback else "")
+    )
 
 
 # ------------------------ orchestrator ------------------------
@@ -1396,7 +1423,7 @@ def run_walkforward(cfg_path: str, force: bool, clean: bool, only: Optional[str]
     progress_on = bool(cfg.get("io", {}).get("progress", True))
 
 
-    skip_set = set((cfg.get("walkforward") or {}).get("skip_folds", []))
+    skip_set = set((cfg.get("walkforward", {}) or {}).get("skip_folds", []))
 
 
     for sym in symbols:
@@ -1409,11 +1436,7 @@ def run_walkforward(cfg_path: str, force: bool, clean: bool, only: Optional[str]
 
 
             if i in skip_set:
-
-
-                _log(f"[{sym}] SKIP fold {i} (per config)")
-
-
+                _log(f"[{sym}] SKIP fold {i}")
                 continue
 
 
