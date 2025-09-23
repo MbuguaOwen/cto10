@@ -1159,6 +1159,17 @@ def stage_simulate(
 
     ev = ev.sort_values("ts").reset_index(drop=True)
 
+    if "ts" in ev.columns:
+        ev["ts"] = pd.to_numeric(ev["ts"], errors="coerce")
+    if "end_ts" not in ev.columns and "outcome_ts" in ev.columns:
+        ev["end_ts"] = pd.to_numeric(ev["outcome_ts"], errors="coerce")
+    elif "end_ts" in ev.columns:
+        ev["end_ts"] = pd.to_numeric(ev["end_ts"], errors="coerce")
+    else:
+        ev["end_ts"] = pd.Series(np.nan, index=ev.index, dtype="float64")
+    if "pwin" not in ev.columns and "p_win" in ev.columns:
+        ev["pwin"] = pd.to_numeric(ev["p_win"], errors="coerce")
+
     decision_df = cands_t_norm.copy()
     default_enter = pd.Series(False, index=decision_df.index, dtype=bool)
     go_series = (
@@ -1318,6 +1329,23 @@ def stage_simulate(
     )
 
     ev_g = ev[ev["enter"]].copy()
+
+    # --- ensure scheduler-required columns exist & correct types ---
+    if "end_ts" not in ev_g.columns and "outcome_ts" in ev_g.columns:
+        ev_g["end_ts"] = pd.to_numeric(ev_g["outcome_ts"], errors="coerce")
+    elif "end_ts" not in ev_g.columns:
+        ev_g["end_ts"] = pd.Series(np.nan, index=ev_g.index, dtype="float64")
+    if "pwin" not in ev_g.columns and "p_win" in ev_g.columns:
+        ev_g["pwin"] = pd.to_numeric(ev_g["p_win"], errors="coerce")
+    if "ts" in ev_g.columns:
+        ev_g["ts"] = pd.to_numeric(ev_g["ts"], errors="coerce")
+        ev_g = ev_g[ev_g["ts"].notna()].copy()
+        ev_g["ts"] = ev_g["ts"].astype("int64")
+    if "end_ts" in ev_g.columns:
+        ev_g["end_ts"] = pd.to_numeric(ev_g["end_ts"], errors="coerce")
+        ev_g = ev_g[ev_g["end_ts"].notna()].copy()
+        ev_g["end_ts"] = ev_g["end_ts"].astype("int64")
+
     gated_count = int(ev_g.shape[0])
 
     # ---- progress + scheduler cfg ----
@@ -1387,7 +1415,7 @@ def stage_simulate(
     tg = take_sched.copy()
     if "ts" in tg.columns:
         tscol = "ts"
-        tg["_date"] = pd.to_datetime(tg[tscol], unit="s", errors="coerce").dt.date
+        tg["_date"] = pd.to_datetime(tg[tscol], unit="ms", errors="coerce").dt.date
     else:
         tg["_date"] = pd.NaT
 
@@ -1502,7 +1530,6 @@ def stage_simulate(
 
     _log(
         f"[{sym}] simulate[GATED]: kept={len(ev_g)} scheduled={len(take_sched)} wr={g_wr:.3f} expR={g_expR:.2f}"
-        + (" [fallback]" if scheduler_fallback else "")
     )
 
 
