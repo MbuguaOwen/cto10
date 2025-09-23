@@ -1100,14 +1100,9 @@ def stage_simulate(
     gate_bundle = fold_dir / "artifacts" / "gate_bundle.pkl"
     gate_features_cfg = copy.deepcopy(cfg.get("ml_gating", {}))
     gate_features_cfg["gating_path"] = str(gpath)
-    tau_floor_cfg = float((cfg.get("gate", {}) or {}).get("tau_floor", 0.0))
-    tau_override_cfg = (cfg.get("gate", {}) or {}).get("tau_override", None)
-    tau_override_val = None
-    if tau_override_cfg not in (None, ""):
-        try:
-            tau_override_val = float(tau_override_cfg)
-        except Exception:
-            tau_override_val = None
+    gate_cfg_section = (cfg.get("gate", {}) or {})
+    tau_floor = float(gate_cfg_section.get("tau_floor", 0.0))
+    tau_override = gate_cfg_section.get("tau_override", None)
     gate_tau = float("nan")
     coverage = 0.0
     empirical_ppv = float("nan")
@@ -1116,17 +1111,21 @@ def stage_simulate(
         try:
             gate = load_trained_gate(gate_bundle)
             tau_raw = getattr(gate, "tau", None)
-            tau_used = tau_raw
-            if tau_override_val is not None:
-                tau_used = tau_override_val
-            elif tau_raw is not None and tau_floor_cfg > 0.0:
-                tau_val = float(tau_raw)
-                tau_used = tau_floor_cfg if np.isnan(tau_val) else max(tau_floor_cfg, tau_val)
-            elif tau_raw is not None:
-                tau_used = float(tau_raw)
-            if tau_used is None:
-                tau_used = float("nan")
-            gate.tau = float(tau_used)
+            tau = tau_raw
+            if tau_override not in (None, ""):
+                try:
+                    tau = float(tau_override)
+                except Exception:
+                    tau = tau_raw
+            elif tau is not None and tau_floor > 0.0:
+                try:
+                    tau_val = float(tau)
+                except Exception:
+                    tau_val = None
+                if tau_val is not None:
+                    tau = tau_floor if np.isnan(tau_val) else max(tau_val, tau_floor)
+            if tau is not None:
+                gate.tau = float(tau)
             gate_tau = gate.tau
             _log(f"[{sym}] gate: tau_used={gate_tau:.4f}")
             X_test, y_test, literals = literalize_candidates(cands_t_norm, gate_features_cfg, gate.feature_meta)
@@ -1328,18 +1327,25 @@ def stage_simulate(
     upd_every = int(prog_cfg.get("schedule_update_every", 1000))
 
     sched_cfg = (cfg.get("execution_sim", {}) or {}).get("scheduler", {}) or {}
-    weight_mode = str(sched_cfg.get("weight_mode", sched_cfg.get("weight", "expR")))
-    sched_r_mult = float(sched_cfg.get("r_mult", 5.0))
+    weight_mode = str(sched_cfg.get("weight_mode", "expR"))
+    r_mult = float(sched_cfg.get("r_mult", 5.0))
     timeout_sec = sched_cfg.get("timeout_sec", None)
     timeout_sec = float(timeout_sec) if timeout_sec is not None else None
-
-    chunk_by = sched_cfg.get("chunk_by", None)  # None | "day" | "12h"
+    chunk_by = sched_cfg.get("chunk_by", None)
     topk_hour = sched_cfg.get("topk_per_hour", None)
     topk_hour = int(topk_hour) if topk_hour not in (None, "") else None
     enforce_xc = bool(sched_cfg.get("enforce_cross_chunk_nonoverlap", True))
 
     # pre-schedule snapshot to guarantee downstream artifacts exist
     ev_g.to_csv(fold_dir / "trades_gated_presched.csv", index=False)
+
+    entry_delay_bars = int((cfg.get("execution_sim", {}) or {}).get("entry_delay_bars", 0))
+    bar_ms = int(((cfg.get("data", {}) or {}).get("bar_ms", 60_000)))
+    if entry_delay_bars > 0 and len(ev_g):
+        shift = entry_delay_bars * bar_ms
+        ev_g = ev_g.copy()
+        ev_g["ts"] = ev_g["ts"] + shift
+        ev_g["end_ts"] = ev_g["end_ts"] + shift
 
     if fold_idx is not None and len(test_months):
         progress_label = f"{desc_inner} [{sym}|Fold {fold_idx}|test={test_months[0]}]"
@@ -1354,7 +1360,7 @@ def stage_simulate(
         take_sched = schedule_non_overlapping(
             ev_g,
             weight_mode=weight_mode,
-            r_mult=sched_r_mult,
+            r_mult=r_mult,
             show_progress=show_inner,
             progress_desc=progress_label,
             update_every=upd_every,
@@ -1489,7 +1495,7 @@ def stage_simulate(
             "timeouts": g_timeouts,
             "win_rate": float(g_wins / denom_outcomes) if denom_outcomes else 0.0,
             "expected_R_per_event": expected_R_per_event,
-            "r_mult": sched_r_mult,
+        "r_mult": r_mult,
             "scheduler_fallback": scheduler_fallback,
         },
     )

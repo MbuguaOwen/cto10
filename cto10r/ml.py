@@ -973,7 +973,7 @@ def schedule_non_overlapping(
     progress_desc="schedule",
     update_every=500,
     timeout_sec=None,
-    # NEW:
+    # NEW knobs:
     chunk_by=None,                    # None | "day" | "12h"
     topk_per_hour=None,               # None | int
     enforce_cross_chunk_nonoverlap=True,
@@ -982,30 +982,14 @@ def schedule_non_overlapping(
     Select a non-overlapping subset of df (interval trades) maximizing weight.
     Extended with optional chunking and Top-K per hour prefilter.
 
-    Columns expected: ts (start, ms), end_ts (end, ms).
-    Optional weight columns: pwin, score, expR components used by existing logic.
+    Expects columns: ts (ms), end_ts (ms), plus pwin/score/expR features.
     """
-
-    import pandas as pd
     import numpy as np
+    import pandas as pd
 
     if df is None or len(df) == 0:
         return df.iloc[0:0].copy()
 
-    if "ts" not in df.columns:
-        return df.iloc[0:0].copy()
-
-    df = df.copy()
-    if "end_ts" not in df.columns:
-        if "outcome_ts" in df.columns:
-            df["end_ts"] = df["outcome_ts"]
-        else:
-            return df.iloc[0:0].copy()
-
-    if update_every is None or update_every <= 0:
-        update_every = 500
-
-    # ---------- helper: pick weight vector ----------
     def _weights(sub):
         if weight_mode == "pwin":
             if "pwin" in sub.columns:
@@ -1015,43 +999,30 @@ def schedule_non_overlapping(
             else:
                 w = np.ones(len(sub), dtype=float)
         else:
-            # keep existing expR path in your implementation
-            w = _existing_weight_vector_expR(sub, r_mult=r_mult)  # <- call your current logic
+            # reuse the project’s current expR weight logic
+            w = _existing_weight_vector_expR(sub, r_mult=r_mult)
         return w
 
-    # ---------- helper: core (DP with greedy fallback) ----------
-    def _schedule_core(sub):
-        # EXPECT: sub has ts, end_ts
-        if len(sub) == 0:
-            return sub
-
-        # Sort by end time (classical weighted interval scheduling)
-        sub = sub.sort_values(["end_ts", "ts"]).reset_index(drop=False)  # keep original index
-        idx_col = "index"  # original row index retained
-
-        # compute weights
+    def _dp_or_greedy(sub):
+        sub = sub.sort_values(["end_ts", "ts"]).reset_index(drop=False)
+        idx_col = "index"
         w = _weights(sub)
-
-        # try DP with timeout; fallback to greedy if timeout occurs
         try:
-            scheduled_mask = _dp_interval_schedule_with_timeout(
+            m = _dp_interval_schedule_with_timeout(
                 sub,
                 w,
                 timeout_sec=timeout_sec,
                 show_progress=show_progress,
                 progress_desc=progress_desc,
-                update_every=update_every,
             )
-            if scheduled_mask is None:
+            if m is None:
                 raise TimeoutError
-            take = sub.loc[scheduled_mask]
+            take = sub.loc[m]
             return df.loc[take[idx_col].to_numpy()].copy()
         except Exception:
-            # Greedy deterministic fallback: (pwin desc, end_ts asc, ts asc)
-            # NOTE: np.lexsort uses last key as primary sort key.
-            order = np.lexsort((sub["ts"].to_numpy(), sub["end_ts"].to_numpy(), -w))
-            sel = []
-            last_end = -1
+            # deterministic greedy: (pwin desc, end_ts asc, ts asc)
+            order = np.lexsort((sub["ts"].to_numpy(), sub["end_ts"].to_numpy(), -_weights(sub)))
+            sel, last_end = [], -1
             for i in order:
                 st = int(sub.iat[i, sub.columns.get_loc("ts")])
                 en = int(sub.iat[i, sub.columns.get_loc("end_ts")])
@@ -1061,69 +1032,47 @@ def schedule_non_overlapping(
             take = sub.iloc[sel]
             return df.loc[take[idx_col].to_numpy()].copy()
 
-    # ---------- helper: Top-K per hour prefilter ----------
     def _prefilter_topk_hour(sub, k):
         if not k or k <= 0 or len(sub) == 0:
             return sub
-        col = "pwin" if "pwin" in sub.columns else ("score" if "score" in sub.columns else None)
-        if col is None:
+        key = "pwin" if "pwin" in sub.columns else ("score" if "score" in sub.columns else None)
+        if key is None:
             return sub
         s = pd.to_datetime(sub["ts"], unit="ms")
         sub = sub.assign(_hour=s.dt.floor("H"))
-        sub = sub.sort_values([col, "end_ts", "ts"], ascending=[False, True, True])
-        # Group by hour; take top-K
+        sub = sub.sort_values([key, "end_ts", "ts"], ascending=[False, True, True])
         out = sub.groupby("_hour", observed=True).head(k).drop(columns="_hour")
         return out
 
-    # ---------- helper: chunk key ----------
     def _chunk_key(sub, mode):
         t = pd.to_datetime(sub["ts"], unit="ms")
         if mode == "day":
             return t.dt.floor("D")
-        elif mode == "12h":
+        if mode == "12h":
             return t.dt.floor("12H")
-        else:
-            return None
+        return None
 
-    # ---------- main ----------
-    work = df.copy()
-
-    # Optional Top-K per hour
-    work = _prefilter_topk_hour(work, topk_per_hour)
+    work = _prefilter_topk_hour(df.copy(), topk_per_hour)
 
     if chunk_by in ("day", "12h"):
-        # Chunk, schedule per chunk, then concatenate
-        key = _chunk_key(work, chunk_by)
-        work = work.assign(_chunk_key=key)
+        work = work.assign(_chunk=_chunk_key(work, chunk_by))
         parts = []
-        for _, sub in work.groupby("_chunk_key", observed=True):
-            sub = sub.drop(columns=["_chunk_key"])
-            take_sub = _schedule_core(sub)
-            parts.append(take_sub)
-        if parts:
-            merged = pd.concat(parts, ignore_index=True)
-        else:
-            merged = work.iloc[0:0].copy()
+        for _, sub in work.groupby("_chunk", observed=True):
+            take = _dp_or_greedy(sub.drop(columns=["_chunk"]))
+            parts.append(take)
+        merged = pd.concat(parts, ignore_index=True) if parts else work.iloc[0:0].copy()
 
-        # Optional cross-chunk deconflict (just in case long trades span chunks)
         if enforce_cross_chunk_nonoverlap and len(merged) > 0:
             merged = merged.sort_values(["end_ts", "ts"])
-            chosen_idx = []
-            last_end = -1
-            for idx, row in merged.iterrows():
-                st = int(row["ts"])
-                en = int(row["end_ts"])
-                if st >= last_end:
-                    chosen_idx.append(idx)
-                    last_end = en
-            if chosen_idx:
-                merged = merged.iloc[chosen_idx]
-            else:
-                merged = merged.iloc[0:0].copy()
+            chosen, last_end = [], -1
+            for _, r in merged.iterrows():
+                if int(r["ts"]) >= last_end:
+                    chosen.append(r)
+                    last_end = int(r["end_ts"])
+            merged = pd.DataFrame(chosen)
         return merged.reset_index(drop=True)
 
-    # No chunking: run core once
-    return _schedule_core(work).reset_index(drop=True)
+    return _dp_or_greedy(work).reset_index(drop=True)
 
 
 def _extract_y(df: pd.DataFrame) -> np.ndarray:
