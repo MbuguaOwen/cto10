@@ -39,7 +39,10 @@ execution_sim:
     weight: "pwin"           # expR | pwin
     weight_mode: "pwin"  # precision-first scheduling when 'pwin' is present
     r_mult: 5.0          # kept for expR fallback paths
-    timeout_sec: 180     # give DP more time before greedy fallback
+    timeout_sec: 300     # more headroom for DP planner
+    chunk_by: "day"        # null|"day"|"12h" — enables chunked scheduling
+    topk_per_hour: 3       # null|int — prefilter to top-K pwin per hour
+    enforce_cross_chunk_nonoverlap: true  # ensure no overlap across chunks
     
 # ---- Tripwires to auto-flag bad behavior in sim outputs ----
 tripwires:
