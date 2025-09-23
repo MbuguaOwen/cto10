@@ -1100,6 +1100,7 @@ def stage_simulate(
     gate_bundle = fold_dir / "artifacts" / "gate_bundle.pkl"
     gate_features_cfg = copy.deepcopy(cfg.get("ml_gating", {}))
     gate_features_cfg["gating_path"] = str(gpath)
+    tau_floor_cfg = float((cfg.get("gate", {}) or {}).get("tau_floor", 0.0))
     gate_tau = float("nan")
     coverage = 0.0
     empirical_ppv = float("nan")
@@ -1107,6 +1108,13 @@ def stage_simulate(
     if gate_bundle.exists():
         try:
             gate = load_trained_gate(gate_bundle)
+            tau_raw = getattr(gate, "tau", None)
+            if tau_raw is not None and tau_floor_cfg > 0.0:
+                tau_val = float(tau_raw)
+                tau_clamped = tau_floor_cfg if np.isnan(tau_val) else max(tau_floor_cfg, tau_val)
+                gate.tau = tau_clamped
+                gate_tau = tau_clamped
+                _log(f"[{sym}] gate: tau clamped to floor={tau_floor_cfg:.4f} -> tau_used={tau_clamped:.4f}")
             X_test, y_test, literals = literalize_candidates(cands_t_norm, gate_features_cfg, gate.feature_meta)
             p_vals = gate.score(X_test)
             losers_fire = gate.loser_mask_vec(literals)
@@ -1306,7 +1314,7 @@ def stage_simulate(
     upd_every = int(prog_cfg.get("schedule_update_every", 1000))
 
     sched_cfg = (cfg.get("execution_sim", {}) or {}).get("scheduler", {}) or {}
-    weight_mode = str(sched_cfg.get("weight_mode", "expR"))
+    weight_mode = str(sched_cfg.get("weight_mode", sched_cfg.get("weight", "expR")))
     sched_r_mult = float(sched_cfg.get("r_mult", 5.0))
     timeout_sec = sched_cfg.get("timeout_sec", None)
     timeout_sec = float(timeout_sec) if timeout_sec is not None else None

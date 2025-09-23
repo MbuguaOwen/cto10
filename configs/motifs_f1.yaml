@@ -17,7 +17,7 @@ walkforward:
   train_months: 3
   test_months: 1
   step_months: 1
-  skip_folds: []            # leave empty; with Jan–May you'll naturally get 2 folds
+  skip_folds: [0]           # run fold 1 only (skip fold 0)
   # If you want to run all months but skip unstable folds, set skip_folds: [2,3,4] instead of shrinking months.
 
 # ---- Sim progress + scheduler settings ----
