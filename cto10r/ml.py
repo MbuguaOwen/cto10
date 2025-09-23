@@ -895,132 +895,235 @@ def score_ml(cands_df: pd.DataFrame, fold_dir: Path, ml_cfg: dict) -> pd.Series:
     return pd.Series(p, index=cands_df.index, name="pwin")
 
 
-def schedule_non_overlapping(
-    df: pd.DataFrame,
-    weight_mode: str = "expR",
-    r_mult: float = 5.0,
-    show_progress: bool = True,
+def _existing_weight_vector_expR(sub: pd.DataFrame, *, r_mult: float = 5.0) -> np.ndarray:
+    if sub is None or len(sub) == 0:
+        return np.zeros(0, dtype=float)
+    if "pwin" in sub.columns:
+        p = pd.to_numeric(sub["pwin"], errors="coerce").fillna(0.0).to_numpy()
+    else:
+        p = np.ones(len(sub), dtype=float)
+    return (float(r_mult) * p) - (1.0 - p)
+
+
+def _dp_interval_schedule_with_timeout(
+    sub: pd.DataFrame,
+    weights: np.ndarray,
+    *,
+    timeout_sec: Optional[float] = None,
+    show_progress: bool = False,
     progress_desc: str = "schedule",
     update_every: int = 1000,
-    timeout_sec: Optional[float] = None,
-) -> pd.DataFrame:
-    """
-    Weighted non-overlapping interval selection (interval scheduling):
-      - If weight_mode == "expR": weight = r_mult*pwin - (1-pwin)
-      - If weight_mode in {"pwin","score"} and such column exists: use that column directly
-      - Otherwise, weights default to 1.0 (uniform)
-    Progress bar uses true, bounded totals; timeout triggers a deterministic greedy fallback.
-    Always returns a scheduled subset of the *gated* input df.
-    """
-    if len(df) == 0:
-        return df.copy()
+):
+    n = len(sub)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
 
-    # require ts and end_ts/outcome_ts
-    if "ts" not in df.columns:
-        return df.copy()
-    if "end_ts" in df.columns:
-        end_ts = pd.to_numeric(df["end_ts"], errors="coerce").to_numpy()
-    elif "outcome_ts" in df.columns:
-        end_ts = pd.to_numeric(df["outcome_ts"], errors="coerce").to_numpy()
-    else:
-        return df.copy()
+    ts = pd.to_numeric(sub["ts"], errors="coerce").to_numpy()
+    end_ts = pd.to_numeric(sub["end_ts"], errors="coerce").to_numpy()
 
-    ts = pd.to_numeric(df["ts"], errors="coerce").to_numpy()
-    order = np.argsort(end_ts, kind="mergesort")
-    ts = ts[order]
-    end_ts = end_ts[order]
-
-    # compute weights
-    if weight_mode in ("pwin", "score"):
-        col = "pwin" if "pwin" in df.columns else ("score" if "score" in df.columns else None)
-        if col is not None:
-            w = pd.to_numeric(df[col], errors="coerce").fillna(0.0).to_numpy()[order]
-        else:
-            w = np.ones_like(ts, dtype=float)
-    elif weight_mode == "expR":
-        if "pwin" in df.columns:
-            p = pd.to_numeric(df["pwin"], errors="coerce").fillna(0.0).to_numpy()[order]
-        else:
-            p = np.ones_like(ts, dtype=float)
-        w = (float(r_mult) * p) - (1.0 - p)
-    else:
-        w = np.ones_like(ts, dtype=float)
-
-    # rightmost compatible index for each i: end_ts[j] <= ts[i]
-    import bisect
-
-    pidx = [bisect.bisect_right(end_ts, ts[i]) - 1 for i in range(len(ts))]
-    n = len(ts)
     if update_every is None or update_every <= 0:
         update_every = 1000
 
+    import bisect
+
+    pidx = [bisect.bisect_right(end_ts, ts[i]) - 1 for i in range(n)]
+    dp = np.zeros(n + 1, dtype=float)
+    choose = np.zeros(n, dtype=bool)
+
     start = time.time()
+    for i in range(1, n + 1):
+        skip = dp[i - 1]
+        prev_idx = pidx[i - 1]
+        take = weights[i - 1] + (dp[prev_idx + 1] if prev_idx >= 0 else 0.0)
+        if take > skip:
+            dp[i] = take
+            choose[i - 1] = True
+        else:
+            dp[i] = skip
+        if timeout_sec is not None and timeout_sec > 0 and (time.time() - start) > timeout_sec:
+            return None
 
-    try:
-        # DP forward
-        dp = np.zeros(n + 1, dtype=float)
-        choose = np.zeros(n, dtype=bool)
-        for i in range(1, n + 1):
-            skip = dp[i - 1]
-            take = w[i - 1] + (dp[pidx[i - 1] + 1] if pidx[i - 1] >= 0 else 0.0)
-            if take > skip:
-                dp[i] = take
-                choose[i - 1] = True
+    mask = np.zeros(n, dtype=bool)
+    tick = 0
+    pbar = tqdm(total=n, desc=progress_desc, disable=not show_progress)
+    i = n
+    while i > 0:
+        if choose[i - 1]:
+            mask[i - 1] = True
+            i = pidx[i - 1] + 1
+        else:
+            i -= 1
+        tick += 1
+        if show_progress and tick >= update_every:
+            pbar.update(tick)
+            tick = 0
+    if show_progress:
+        if tick:
+            pbar.update(tick)
+        pbar.close()
+    return mask
+
+
+def schedule_non_overlapping(
+    df,
+    *,
+    weight_mode="expR",
+    r_mult=5.0,
+    show_progress=False,
+    progress_desc="schedule",
+    update_every=500,
+    timeout_sec=None,
+    # NEW:
+    chunk_by=None,                    # None | "day" | "12h"
+    topk_per_hour=None,               # None | int
+    enforce_cross_chunk_nonoverlap=True,
+):
+    """
+    Select a non-overlapping subset of df (interval trades) maximizing weight.
+    Extended with optional chunking and Top-K per hour prefilter.
+
+    Columns expected: ts (start, ms), end_ts (end, ms).
+    Optional weight columns: pwin, score, expR components used by existing logic.
+    """
+
+    import pandas as pd
+    import numpy as np
+
+    if df is None or len(df) == 0:
+        return df.iloc[0:0].copy()
+
+    if "ts" not in df.columns:
+        return df.iloc[0:0].copy()
+
+    df = df.copy()
+    if "end_ts" not in df.columns:
+        if "outcome_ts" in df.columns:
+            df["end_ts"] = df["outcome_ts"]
+        else:
+            return df.iloc[0:0].copy()
+
+    if update_every is None or update_every <= 0:
+        update_every = 500
+
+    # ---------- helper: pick weight vector ----------
+    def _weights(sub):
+        if weight_mode == "pwin":
+            if "pwin" in sub.columns:
+                w = pd.to_numeric(sub["pwin"], errors="coerce").fillna(0.0).to_numpy()
+            elif "score" in sub.columns:
+                w = pd.to_numeric(sub["score"], errors="coerce").fillna(0.0).to_numpy()
             else:
-                dp[i] = skip
-            if timeout_sec and (time.time() - start) > timeout_sec:
-                raise TimeoutError("schedule timeout")
+                w = np.ones(len(sub), dtype=float)
+        else:
+            # keep existing expR path in your implementation
+            w = _existing_weight_vector_expR(sub, r_mult=r_mult)  # <- call your current logic
+        return w
 
-        # Backtrack with bounded progress
-        pbar = tqdm(total=n, desc=progress_desc, disable=not show_progress)
-        last_tick = 0
-        sel = []
-        i = n
-        while i > 0:
-            if choose[i - 1]:
-                sel.append(i - 1)
-                i = pidx[i - 1] + 1
+    # ---------- helper: core (DP with greedy fallback) ----------
+    def _schedule_core(sub):
+        # EXPECT: sub has ts, end_ts
+        if len(sub) == 0:
+            return sub
+
+        # Sort by end time (classical weighted interval scheduling)
+        sub = sub.sort_values(["end_ts", "ts"]).reset_index(drop=False)  # keep original index
+        idx_col = "index"  # original row index retained
+
+        # compute weights
+        w = _weights(sub)
+
+        # try DP with timeout; fallback to greedy if timeout occurs
+        try:
+            scheduled_mask = _dp_interval_schedule_with_timeout(
+                sub,
+                w,
+                timeout_sec=timeout_sec,
+                show_progress=show_progress,
+                progress_desc=progress_desc,
+                update_every=update_every,
+            )
+            if scheduled_mask is None:
+                raise TimeoutError
+            take = sub.loc[scheduled_mask]
+            return df.loc[take[idx_col].to_numpy()].copy()
+        except Exception:
+            # Greedy deterministic fallback: (pwin desc, end_ts asc, ts asc)
+            # NOTE: np.lexsort uses last key as primary sort key.
+            order = np.lexsort((sub["ts"].to_numpy(), sub["end_ts"].to_numpy(), -w))
+            sel = []
+            last_end = -1
+            for i in order:
+                st = int(sub.iat[i, sub.columns.get_loc("ts")])
+                en = int(sub.iat[i, sub.columns.get_loc("end_ts")])
+                if st >= last_end:
+                    sel.append(i)
+                    last_end = en
+            take = sub.iloc[sel]
+            return df.loc[take[idx_col].to_numpy()].copy()
+
+    # ---------- helper: Top-K per hour prefilter ----------
+    def _prefilter_topk_hour(sub, k):
+        if not k or k <= 0 or len(sub) == 0:
+            return sub
+        col = "pwin" if "pwin" in sub.columns else ("score" if "score" in sub.columns else None)
+        if col is None:
+            return sub
+        s = pd.to_datetime(sub["ts"], unit="ms")
+        sub = sub.assign(_hour=s.dt.floor("H"))
+        sub = sub.sort_values([col, "end_ts", "ts"], ascending=[False, True, True])
+        # Group by hour; take top-K
+        out = sub.groupby("_hour", observed=True).head(k).drop(columns="_hour")
+        return out
+
+    # ---------- helper: chunk key ----------
+    def _chunk_key(sub, mode):
+        t = pd.to_datetime(sub["ts"], unit="ms")
+        if mode == "day":
+            return t.dt.floor("D")
+        elif mode == "12h":
+            return t.dt.floor("12H")
+        else:
+            return None
+
+    # ---------- main ----------
+    work = df.copy()
+
+    # Optional Top-K per hour
+    work = _prefilter_topk_hour(work, topk_per_hour)
+
+    if chunk_by in ("day", "12h"):
+        # Chunk, schedule per chunk, then concatenate
+        key = _chunk_key(work, chunk_by)
+        work = work.assign(_chunk_key=key)
+        parts = []
+        for _, sub in work.groupby("_chunk_key", observed=True):
+            sub = sub.drop(columns=["_chunk_key"])
+            take_sub = _schedule_core(sub)
+            parts.append(take_sub)
+        if parts:
+            merged = pd.concat(parts, ignore_index=True)
+        else:
+            merged = work.iloc[0:0].copy()
+
+        # Optional cross-chunk deconflict (just in case long trades span chunks)
+        if enforce_cross_chunk_nonoverlap and len(merged) > 0:
+            merged = merged.sort_values(["end_ts", "ts"])
+            chosen_idx = []
+            last_end = -1
+            for idx, row in merged.iterrows():
+                st = int(row["ts"])
+                en = int(row["end_ts"])
+                if st >= last_end:
+                    chosen_idx.append(idx)
+                    last_end = en
+            if chosen_idx:
+                merged = merged.iloc[chosen_idx]
             else:
-                i -= 1
-            if show_progress:
-                last_tick += 1
-                if last_tick >= update_every:
-                    pbar.update(last_tick)
-                    last_tick = 0
-        if show_progress:
-            if last_tick:
-                pbar.update(last_tick)
-            pbar.close()
+                merged = merged.iloc[0:0].copy()
+        return merged.reset_index(drop=True)
 
-        sel = np.array(sorted(sel))
-        return df.iloc[order[sel]].copy()
-
-    except (KeyboardInterrupt, TimeoutError, MemoryError):
-        # Greedy deterministic fallback by (weight desc, end_ts asc) with accurate progress
-        # IMPORTANT: np.lexsort uses the LAST key as primary sort key.
-        idx = np.lexsort((end_ts, -w))
-        end_ts_sorted = end_ts[idx]
-        ts_sorted = ts[idx]
-
-        keep = np.zeros(n, dtype=bool)
-        last_end = -np.inf
-        pbar = tqdm(total=n, desc=f"{progress_desc}[greedy]", disable=not show_progress)
-        tick = 0
-        for k in range(n):
-            i = idx[k]
-            if ts_sorted[k] >= last_end:
-                keep[i] = True
-                last_end = end_ts_sorted[k]
-            tick += 1
-            if show_progress and (tick % update_every == 0):
-                pbar.update(update_every)
-        if show_progress:
-            if tick % update_every:
-                pbar.update(tick % update_every)
-            pbar.close()
-
-        sel = np.flatnonzero(keep)
-        return df.iloc[order[sel]].copy()
+    # No chunking: run core once
+    return _schedule_core(work).reset_index(drop=True)
 
 
 def _extract_y(df: pd.DataFrame) -> np.ndarray:
