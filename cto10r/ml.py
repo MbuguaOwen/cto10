@@ -996,8 +996,9 @@ def schedule_non_overlapping(
         return df.iloc[order[sel]].copy()
 
     except (KeyboardInterrupt, TimeoutError, MemoryError):
-        # Greedy deterministic fallback by (end_ts asc, weight desc) with accurate progress
-        idx = np.lexsort((-w, end_ts))
+        # Greedy deterministic fallback by (weight desc, end_ts asc) with accurate progress
+        # IMPORTANT: np.lexsort uses the LAST key as primary sort key.
+        idx = np.lexsort((end_ts, -w))
         end_ts_sorted = end_ts[idx]
         ts_sorted = ts[idx]
 
