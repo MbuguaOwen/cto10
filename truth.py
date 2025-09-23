@@ -1,5 +1,10 @@
 from pathlib import Path
+import argparse
 import json, pandas as pd
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--presched", action="store_true")
+args = ap.parse_args()
 
 ROOT = Path("outputs/BTCUSDT")
 FOLDS = [0,1,2,3]
@@ -14,16 +19,18 @@ def load_gate_summary(fd: Path):
 
 
 def load_trades(fd: Path):
-    p1 = fd / "trades_gated.csv"
-    p2 = fd / "trades_gated_presched.csv"
-    if p1.exists():
-        return pd.read_csv(p1)
-    if p2.exists():
-        return pd.read_csv(p2)
+    p_pre = fd / "trades_gated_presched.csv"
+    p_post = fd / "trades_gated.csv"
+    if args.presched and p_pre.exists():
+        return pd.read_csv(p_pre)
+    if p_post.exists():
+        return pd.read_csv(p_post)
+    if p_pre.exists():
+        return pd.read_csv(p_pre)
     raise FileNotFoundError(f"[{fd.name}] no trades_gated(.csv|_presched.csv)")
 
 
-rows=[]
+rows = []
 for f in FOLDS:
     fd = ROOT / f"fold_{f}"
     gs = load_gate_summary(fd)
