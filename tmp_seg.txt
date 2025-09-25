@@ -1,0 +1,51 @@
+﻿
+    if skip_if_exists(epath, force):
+
+
+        _log(f"[{sym}] SKIP tick_labeling (exists)")
+
+
+        return
+
+
+    # Friendly guard: require features stage to exist
+    cpath = fold_dir / "candidates.parquet"
+    if not cpath.exists():
+        raise FileNotFoundError(
+            f"{cpath} not found. Run features stage first:\n"
+            f"  python -m cto10r --config {cfg_path} --mode walkforward --only features --force"
+        )
+    cands = pd.read_parquet(cpath)
+
+
+    if cands.empty:
+
+
+        empty_events = pd.DataFrame(columns=["ts", "side", "entry", "level", "risk_dist", "outcome"])
+        empty_events = normalize_events_schema(empty_events)
+        empty_events.attrs["no_ticks_windows"] = 0
+        empty_events.to_parquet(epath, index=False)
+
+
+        _log(f"[{sym}] events: 0 (no candidates)")
+
+
+        _write_fingerprint(
+            artifacts_dir,
+            "tick_labeling",
+            cfg_path,
+            {
+                "train_months": list(train_months),
+                "test_months": list(test_months),
+                "events": 0,
+                "wins": 0,
+                "losses": 0,
+                "timeouts": 0,
+                "preempted": 0,
+                "no_ticks_windows": 0,
+                "tick_files": tick_file_info,
+            },
+        )
+
+
+        return

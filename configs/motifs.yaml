@@ -2,7 +2,6 @@ io:
   outputs_root: outputs
   progress: true
 
-# ---- Limit to folds 0–1 only (Jan–May → tests Apr, May) ----
 data:
   symbols: [BTCUSDT]
   bars_dir: inputs/bars_1m
@@ -10,227 +9,159 @@ data:
   bar_schema: auto
   file_patterns:
     bars: "{SYMBOL}/{SYMBOL}-1m-{YYYY}-{MM}.csv"
-    ticks: "{SYMBOL}/{SYMBOL}-ticks-{YYYY}-{MM}.csv"   # auto-detect parquet too
-  months: { start: "2025-01", end: "2025-05" }
+    ticks: "{SYMBOL}/{SYMBOL}-ticks-{YYYY}-{MM}.csv"
+  months: { start: "2025-01", end: "2025-08" }
 
 walkforward:
   train_months: 3
   test_months: 1
   step_months: 1
-  skip_folds: []            # leave empty; with Jan–May you'll naturally get 2 folds
-  # If you want to run all months but skip unstable folds, set skip_folds: [2,3,4] instead of shrinking months.
-
-# ---- Sim progress + scheduler settings ----
-progress:
-  sim:
-    inner_schedule_bar: true
-    schedule_desc: "schedule"
-    schedule_update_every: 1000
-
-execution_sim:
-  scheduler:
-    weight_mode: "expR"     # precision-first scheduling (if pwin/score exists)
-    r_mult: 5.0             # used when weight_mode="expR"
-    timeout_sec: 60         # DP timeout → deterministic greedy fallback
-    
-# ---- Tripwires to auto-flag bad behavior in sim outputs ----
-tripwires:
-  ppv_lcb_min: 0.50         # rolling 3-day Wilson LCB must stay ≥ this
-  window_days: 3
-  timeout_rate_max: 0.60    # rolling 3-day timeout share must stay ≤ this
-  fallback_days_max: 3      # informational (we track if fallback happens)
+  progress: true
 
 features:
   atr_n: 14
   donch_n_candidate: 20
   percentiles_fit_on: train
-
-  # Age/persistence (applies to base AND non-linear features we mark)
-  age:
-    enabled: true
-    n_bins_feature: 5          # TRAIN-fit quantiles
-    n_bins_age: 6              # TRAIN-fit on age
-    occ_windows: [60, 240]
-    log_age_bins: false
-    save_schema: true
-    schema_file: "artifacts/quantiles.json"
-
-  # Which base columns are fed into age/binning (must exist)
   base_features:
     - t_240; t_60; t_15; accel_15_240
     - atr; dcw; atr_p; dcw_p
     - body_dom; close_to_hi_atr; close_to_lo_atr
-
-  # Non-linear features (all computed from history up to t)
   nonlinear:
     enabled: true
-    windows: { small: 15, mid: 60 }   # integer minutes; used below
-    # Use TRAIN-fit quantiles; no fixed thresholds. τ in code is only a tiny numeric epsilon clamp.
+    windows: { small: 15, mid: 60 }
     include:
-      # A) Trend shape
       - convexity_15_60_240
       - trend_agree_15_60
       - trend_agree_60_240
       - trend_ratio_15_60
-      # B) Compression→release
       - squeeze_score
-      - squeeze_pressure
+      - squeeze_age
       - release_slope_15
-      # C) Location×impulse
-      - pin_high
-      - pin_low
       - impulse_near_high
       - impulse_near_low
-      - pos_01
-      # D) Choppiness
       - zcr_60
       - sign_entropy_60
-      - dc_count_60
-      # E) Vol structure
       - rv60_over_atr
       - range_ratio_60
       - volofvol_proxy
-    # Apply age/occ/since to these as well (quantiles on TRAIN):
     age_for_nonlinear: true
+  age:
+    enabled: true
+    n_bins_feature: 5
+    n_bins_age: 6
+    occ_windows: [60, 240]
+    save_schema: true
+    schema_file: "artifacts/quantiles.json"
 
 candidates:
   mode: blind
   blind:
     thinning:
       type: cusum_by_ret
-      params: { ret_lookback: 240, k_sigma: 0.75, drift: 0.0, min_gap_bars: 10, fallback_stride_k: 10 }
+      params:
+        ret_lookback: 280
+        k_sigma: 2.5
+        drift: 0.0
+        min_gap_bars: 0           # no candidate-level collapse; we’ll dedupe by quick window below
+        fallback_stride_k: 0
     sides: both
+  # 🔕 vol gate removed on purpose
+  vol_prefilter: null
 
 labels:
   r_mult: 5
-  horizon_hours: 72
-  quick_ignition_hours: 2
+  horizon_hours: 120
   non_overlap: true
-  eta_atr: 20.0
-  eta_by_atr_p: []        # optional TRAIN regime map (kept empty by default)
-  eta_cap: { min: 0.10, max: 5.00 }
+  non_overlap_policy: quick       # ✅ restore quick ignition
+  quick_ignition_hours: 6         # ✅ single “busy” window length
+  intra_bar_epsilon_ms: 1
+  min_risk_atr_frac: 0.001
+  eta_atr: 15.0
+  # ✅ restore sane η scaling (previously working band)
+  eta_by_atr_p:
+    - [0, 35, 0.50]
+    - [35, 65, 1.00]
+    - [65, 85, 2.00]
+    - [85, 95, 4.00]
+    - [95, 101, 6.00]
+  eta_cap: { min: 0.50, max: 15.00 }
+  time_scale_from_eta: { base_eta: 0.30, clamp: [0.75, 10.0] }
   stop_band_atr: 0.05
-  consec_ticks: 2
-  dwell_ms: 50
-  time_scale_from_eta: { base_eta: 0.30, clamp: [0.5, 10.0] }
+  no_ticks_policy: skip           # data gaps → admin (excluded from training)
 
 mining:
   rules:
     auto_binning: true
     n_bins_cont: 5
-    min_support_frac: 0.001
-    min_months: 1
-    min_wins: 5
-    metric: precision_lcb
-    wilson_z: 1.96
     max_terms: 2
     top_k: 60
-    progress: true
-    precision_include_timeouts: false
-    # NEW: data-relative strictness
-    min_precision_uplift_abs: 0.03    # +3pp absolute over baseline precision
-    min_precision_uplift_pp: 0        # disable additional pp uplift layer
-    min_lift_lcb: 1.10                # require at least 10% lift on LCB
-    min_resolve_uplift_pp: 0          # no resolve uplift requirement for now
-    max_timeout_rate: 0.90            # keep timeout filter loose while bootstrapping
-    min_resolve_frac: 0.75            # still expect most matches to resolve eventually
-    # Optional absolute floors (set to null to disable)
-    abs_min_plcb: 0.22                # hard floor on precision LCB
-    min_expR_lcb: null                # optional LCB on expected-R if you implement it
-    # Loser mining (blocklist)
+    min_support_frac: 0.001
+    min_months: 2
+    min_wins: 2
+    wilson_z: 1.96
     mine_losers: true
-    loser_top_k: 8                    # keep a small set of stable losers
-    loser_max_precision_ucb: 0.35     # only consider rules whose UCB ≤ 35%
+    loser_top_k: 8
+    loser_max_precision_ucb: 0.35
     loser_min_resolve_frac: 0.40
     loser_min_months: 2
-
-# ---- Guardrails for high-precision gating ----
-gate:
-  mode: ml
-  calibration: isotonic
-  target_ppv_lcb: 0.58      # keep your ~0.60 standard, allows small slack
-  min_coverage: 0.00        # never force coverage up
-  tau_floor: 0.42           # prevents τ collapse (like fold 4)
-  val_months: 1
-  crosses_cap: 30
+    fdr: { enabled: true, alpha: 0.10 }
 
 loser_mask:
   enabled: true
   min_support: 20
-  min_months_with_lift: 0
+  min_months_with_lift: 2
   min_ppv_lcb: 0.55
   save_artifact: true
 
+gate:
+  mode: ml
+  calibration: isotonic
+  target_ppv_lcb: 0.60
+  min_coverage: 0.02
+  val_months: 1
+  crosses_cap: 30
+
 ml_gating:
   enabled: true
-  model: logreg            # logreg | gbdt
-  target_ppv: 0.50         # precision target (validated via Wilson LCB)
-  min_coverage_frac: 0.02  # fallback coverage if target_ppv impossible
-  c_grid: [0.05, 0.1, 0.2, 0.5, 1.0]
-  gbdt_grid:
-    n_estimators: [100, 200]
-    max_depth: [2, 3]
-    learning_rate: [0.05, 0.1]
-    subsample: [0.7, 1.0]
-  class_weight: "balanced"
-  combine_with_motifs: "ml_only"  # and | or | ml_only | motifs_only
+  model: logreg
+  calibration: isotonic
+  target_ppv_lcb: 0.60
+  min_coverage: 0.02
+  val_months: 1
+  crosses_cap: 30
   regime_gate: true
   regime_min_age_bin: 4
   regime_occ_windows: [240]
   features:
-    include_prefixes: ["qbin_", "qbin_agebin_", "since_", "occ_"]
+    include_prefixes: ["qbin_", "qbin_agebin_", "agebin_", "since_", "occ_", "B_"]
     exclude_prefixes: []
-  # ----- new: adaptive binning -----
-  n_bins_cont: auto                   # "auto" enables per-feature selection; else int
+  n_bins_cont: auto
   binning:
-    candidates: [3,4,5,7,10]
-    min_bin_frac: 0.005               # >=0.5% per bin after merges
+    candidates: [3, 4, 5, 7, 10]
+    min_bin_frac: 0.005
     mi_delta_min: 0.002
     ece_delta_min: 0.002
     max_js_month_drift: 0.15
     prefer_monotone: true
-  # ----- new: curated crosses -----
-  crosses:
-    use_motif_crosses: true           # keep existing data-driven crosses
-    enable_curated: true
-    max_total: 30                     # hard cap (includes motif crosses actually kept)
-    top_k_literals_from_winners: 20   # for motif-driven crosses
-    curated:                          # hand-picked pairs; conditions auto-mapped
-      # Regime strength × Regime agreement
-      - [ "qbin_nl_trend_agree_15_60:high", "qbin_nl_trend_agree_60_240:high" ]
-      - [ "qbin_nl_trend_ratio_15_60:high", "qbin_nl_zcr_60:low" ]
-
-      # Compression age × Release trigger
-      - [ "agebin_nl_squeeze_score:old", "qbin_nl_squeeze_score:high" ]
-      - [ "agebin_nl_squeeze_score:old", "qbin_nl_release_slope_15:pos" ]
-
-      # Extreme proximity × Impulse
-      - [ "qbin_close_to_hi_atr:near", "nl_impulse_near_high:eq1" ]
-      - [ "qbin_close_to_lo_atr:near", "nl_impulse_near_low:eq1" ]
-
-      # Chop filters for trend entries
-      - [ "qbin_nl_zcr_60:low", "qbin_nl_sign_entropy_60:low" ]
-      - [ "qbin_nl_dc_count_60:low", "qbin_nl_trend_agree_60_240:high" ]
-
-      # Range/Vol structure
-      - [ "qbin_nl_range_ratio_60:low", "qbin_nl_rv60_over_atr:high" ]
-      - [ "qbin_nl_volofvol_proxy:low", "qbin_nl_trend_agree_60_240:high" ]
-
-      # Shape × Trend
-      - [ "qbin_nl_convexity_15_60_240:high", "qbin_nl_trend_ratio_15_60:high" ]
-      - [ "qbin_body_dom:high", "qbin_close_to_hi_atr:near_or_low" ]   # near (low bin) or top proximity bucket
-      - [ "qbin_body_dom:high", "qbin_close_to_lo_atr:near_or_low" ]
-
-      # Occupancy/Since × Trend
-      - [ "occ_highbin_t_60_W240:high", "qbin_nl_trend_agree_60_240:high" ]
-      - [ "since_lowbin_dcw:small", "qbin_nl_trend_agree_15_60:high" ]
 
 execution_sim:
-  use_rules: true
-  use_blocklist: false
-  min_winner_votes: 2        # k-of-n voting for motifs
-  min_rule_precision_lcb: 0.0  # optional pruning of winners
-  min_rule_support: 0          # optional pruning of winners
-  scheduler:
+  fees:
+    maker_bps: 1.0
+    taker_bps: 5.0
+    entry_is_maker: false
+    exit_is_maker: true
+  funding:
     enabled: true
-    weight: "expR"           # expR | pwin
+    rate_per_hour: 0.0001
+    sign: 1.0
+  inventory:
+    enable: false                 # overlaps are administratively blocked by quick window
+
+tests:
+  parity:
+    enabled: false
+    signals_ref_csv: null
+    trades_ref_csv: null
+    r_tol: 0.02
+    max_signal_mismatch: 0
+

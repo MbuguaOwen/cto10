@@ -1,0 +1,131 @@
+﻿
+    trades["R_costs"] = fee_R + (funding_R if isinstance(funding_R, (pd.Series, np.ndarray)) else float(funding_R))
+    trades["R"] = trades["R_gross"] - trades["R_costs"]
+
+    # Export with schema
+    trades_export = normalize_events_schema(trades)
+    trades_export.to_csv(tpath, index=False)
+
+    cands_export = normalize_cands_schema(cands_t_norm)
+    cands_export.to_csv(trpath, index=False)
+
+    wins_fp_cols = ["ts", "side", "rule_id"] + [c for c in RULE_FINGERPRINT_FEATURES if c in ev.columns]
+    ev.loc[ev["outcome"] == "win", wins_fp_cols].to_csv(fold_dir / "wins_fingerprints.csv", index=False)
+
+    stats_existing: Dict[str, Any] = {}
+    if spath.exists():
+        try:
+            with spath.open("r", encoding="utf-8") as f:
+                stats_existing = json.load(f)
+        except Exception:
+            stats_existing = {}
+
+    stats_existing.update(
+        {
+            "total_events": total,
+            "wins_all_events": wins_all,
+            "losses_all_events": losses_all,
+            "timeouts_all_events": timeouts_all,
+            "preempted_events": preempted_total,
+            "win_rate": wr_all,
+            "expected_R_per_event": expR_all,
+            "r_mult": label_r_mult,
+            "gate_coverage": coverage,
+        }
+    )
+
+    stats_existing.update(decided_metrics)
+
+    dump_json(stats_existing, spath)
+    _log(
+        f"[{sym}] simulate: total={total}, wr={wr_all:.3f}, expR={expR_all:.2f}, "
+        f"wins={wins_all}, losses={losses_all}, timeouts={timeouts_all}"
+    )
+
+    # Cost-aware summary (does not change existing outputs)
+    avg_cost_R = float(np.nanmean(trades["R_costs"])) if len(trades) else 0.0
+    _log(
+        f"[{sym}] simulate[costs]: avg_cost_R={avg_cost_R:.4f} maker={maker:.4f} taker={taker:.4f} "
+        f"fund/hr={fund_per_hour:.5f} fund_on={fund_enabled}"
+    )
+
+    ev_g = ev[ev["enter"]].copy()
+    gated_count = int(ev_g.shape[0])
+
+    ev_g_export = normalize_events_schema(ev_g)
+    ev_g_export.to_csv(fold_dir / "trades_gated_presched.csv", index=False)
+
+    if bool(sched_cfg.get("enabled", True)):
+        try:
+            take_sched = schedule_non_overlapping(
+                ev_g,
+                weight_mode=weight_mode,
+                r_mult=sched_r_mult,
+                show_progress=show_inner,
+                progress_desc=desc_inner,
+                update_every=upd_every,
+                timeout_sec=timeout_sec,
+            )
+            scheduler_fallback = False
+        except Exception as exc:
+            _log(f"[{sym}] schedule_non_overlapping fallback: {exc}")
+            take_sched = ev_g.copy()
+            scheduler_fallback = True
+    else:
+        take_sched = ev_g.copy()
+        scheduler_fallback = False
+
+    tw = (cfg.get("tripwires", {}) or {})
+    ppv_lcb_min = float(tw.get("ppv_lcb_min", 0.50))
+    timeout_rate_max = float(tw.get("timeout_rate_max", 0.60))
+    window_days = int(tw.get("window_days", 3))
+    fallback_days_max = int(tw.get("fallback_days_max", 3))
+
+    tg = take_sched.copy()
+    if "ts" in tg.columns:
+        tscol = "ts"
+        tg["_date"] = pd.to_datetime(tg[tscol], unit="s", errors="coerce").dt.date
+    else:
+        tg["_date"] = pd.NaT
+
+    is_win = tg.get("is_win")
+    is_loss = tg.get("is_loss")
+    is_to = tg.get("is_to")
+    if is_win is None or is_loss is None:
+        oc = tg.get("outcome")
+        if oc is not None:
+            oc = oc.fillna("")
+            is_win = (oc == "win").astype(int)
+            is_loss = (oc == "loss").astype(int)
+            if "timeout" in set(oc.unique()):
+                is_to = (oc == "timeout").astype(int)
+            else:
+                is_to = pd.Series([0] * len(tg), index=tg.index, dtype=int)
+        else:
+            zeros = pd.Series([0] * len(tg), index=tg.index, dtype=int)
+            is_win = zeros.copy()
+            is_loss = zeros.copy()
+            is_to = zeros.copy()
+
+    if not isinstance(is_win, pd.Series):
+        is_win = pd.Series(is_win, index=tg.index)
+    if not isinstance(is_loss, pd.Series):
+        is_loss = pd.Series(is_loss, index=tg.index)
+    if not isinstance(is_to, pd.Series):
+        is_to = pd.Series(is_to, index=tg.index)
+
+    tg["is_win"] = pd.to_numeric(is_win, errors="coerce").fillna(0).astype(int)
+    tg["is_loss"] = pd.to_numeric(is_loss, errors="coerce").fillna(0).astype(int)
+    tg["is_to"] = pd.to_numeric(is_to, errors="coerce").fillna(0).astype(int)
+
+    daily = tg.groupby("_date").agg(
+        wins=("is_win", "sum") if "is_win" in tg.columns else ("_date", "size"),
+        losses=("is_loss", "sum") if "is_loss" in tg.columns else ("_date", "size"),
+        timeouts=("is_to", "sum") if "is_to" in tg.columns else ("_date", "size"),
+        scheduled=("_date", "size"),
+    ).reset_index()
+
+    daily["wins_roll"] = daily["wins"].rolling(window_days, min_periods=1).sum()
+    daily["losses_roll"] = daily["losses"].rolling(window_days, min_periods=1).sum()
+    daily["resolved_roll"] = daily["wins_roll"] + daily["losses_roll"]
+    daily["ppv_lcb_roll"] = daily.apply(

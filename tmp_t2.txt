@@ -1,0 +1,140 @@
+﻿                    "outcome_ts": t_end,
+                    "preempted": True,
+                })
+            else:
+                results.append({
+                    **base_row,
+                    "outcome": "timeout",
+                    "outcome_ts": t_end,
+                    "preempted": False,
+                })
+            continue
+
+        tss = tss_all[lo:hi]
+        price = px_all[lo:hi]
+
+        outcome = "timeout"
+        out_ts = t_end
+        r1_ts = None
+        tp_ts = None
+
+        band = stop_band_atr * atr_use
+        violated = False
+        viol_ix = None
+
+        if side == "long":
+            P_eff = level - band
+            below = price < P_eff
+            idx = np.flatnonzero(below)
+            if idx.size:
+                cuts = np.where(np.diff(idx) > 1)[0]
+                starts = np.r_[0, cuts + 1]
+                ends = np.r_[cuts, len(idx) - 1]
+                for s, e in zip(starts, ends):
+                    length = e - s + 1
+                    if length >= consec_ticks and (tss[idx[e]] - tss[idx[s]]) >= dwell_ms:
+                        violated = True
+                        viol_ix = idx[s]
+                        break
+
+            ge_r1 = np.where(price >= r1)[0]
+            ge_tp = np.where(price >= tp)[0]
+
+            if violated and viol_ix is not None and (not ge_tp.size or viol_ix < ge_tp[0]):
+                outcome = "loss"
+                out_ts = int(tss[viol_ix])
+            else:
+                if ge_r1.size and tss[ge_r1[0]] <= t_r1_deadline:
+                    r1_ts = int(tss[ge_r1[0]])
+                    if ge_tp.size:
+                        if (not violated) or (viol_ix is not None and ge_tp[0] < viol_ix):
+                            outcome = "win"
+                            tp_ts = int(tss[ge_tp[0]])
+                            out_ts = tp_ts
+                        else:
+                            outcome = "loss"
+                            out_ts = int(tss[viol_ix])
+                    else:
+                        if violated and viol_ix is not None:
+                            outcome = "loss"
+                            out_ts = int(tss[viol_ix])
+                        else:
+                            outcome = "timeout"
+                            out_ts = t_end
+                else:
+                    outcome = "timeout"
+                    out_ts = t_end
+        else:
+            P_eff = level + band
+            above = price > P_eff
+            idx = np.flatnonzero(above)
+            if idx.size:
+                cuts = np.where(np.diff(idx) > 1)[0]
+                starts = np.r_[0, cuts + 1]
+                ends = np.r_[cuts, len(idx) - 1]
+                for s, e in zip(starts, ends):
+                    length = e - s + 1
+                    if length >= consec_ticks and (tss[idx[e]] - tss[idx[s]]) >= dwell_ms:
+                        violated = True
+                        viol_ix = idx[s]
+                        break
+
+            le_r1 = np.where(price <= r1)[0]
+            le_tp = np.where(price <= tp)[0]
+
+            if violated and viol_ix is not None and (not le_tp.size or viol_ix < le_tp[0]):
+                outcome = "loss"
+                out_ts = int(tss[viol_ix])
+            else:
+                if le_r1.size and tss[le_r1[0]] <= t_r1_deadline:
+                    r1_ts = int(tss[le_r1[0]])
+                    if le_tp.size:
+                        if (not violated) or (viol_ix is not None and le_tp[0] < viol_ix):
+                            outcome = "win"
+                            tp_ts = int(tss[le_tp[0]])
+                            out_ts = tp_ts
+                        else:
+                            outcome = "loss"
+                            out_ts = int(tss[viol_ix])
+                    else:
+                        if violated and viol_ix is not None:
+                            outcome = "loss"
+                            out_ts = int(tss[viol_ix])
+                        else:
+                            outcome = "timeout"
+                            out_ts = t_end
+                else:
+                    outcome = "timeout"
+                    out_ts = t_end
+
+        results.append({
+            "ts": ts_entry,
+            "side": side,
+            "entry": entry,
+            "level": level,
+            "risk_dist": risk,
+            "outcome": outcome,
+            "outcome_ts": int(out_ts),
+            "r1_ts": r1_ts,
+            "tp_ts": tp_ts,
+            "preempted": False,
+        })
+
+        if non_overlap:
+            if str(policy) == "quick":
+                busy_until = max(busy_until, int(t_r1_deadline))
+                if outcome == "win" and tp_ts is not None and np.isfinite(tp_ts):
+                    busy_until = max(busy_until, int(tp_ts))
+            elif str(policy) == "to_exit":
+                busy_until = max(busy_until, int(out_ts))
+            else:
+                busy_until = max(busy_until, int(t_r1_deadline))
+
+    df = pd.DataFrame(results)
+    df.attrs["no_ticks_windows"] = no_ticks_windows
+    df.attrs["fallback_risk_count"] = int(fallback_risk_count)
+    if "preempted" not in df.columns:
+        df["preempted"] = False
+    df["preempted"] = df["preempted"].fillna(False).astype(bool)
+    print(f"[ticks] diagnostics: no_ticks_windows={no_ticks_windows} fallback_risk={fallback_risk_count}")
+    return df

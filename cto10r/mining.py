@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
+from statsmodels.stats.multitest import fdrcorrection
 
 from .util import fit_quantile_edges
 
@@ -28,6 +29,71 @@ def wilson_ucb(k: int, n: int, z: float = 1.96) -> float:
     center = (phat + (z * z) / (2 * n)) / denom
     margin = (z * math.sqrt((phat * (1.0 - phat) / n) + (z * z) / (4 * n * n))) / denom
     return min(1.0, center + margin)
+
+
+def match_rules_vectorized(ev_bin: pd.DataFrame, rules: list[dict], lit_prefix: str = "B_") -> pd.Series:
+    """
+    Returns a pd.Series(rule_id or -1) picking the first satisfied rule by priority order.
+    Each rule is a dict with either:
+      - {"id": ..., "lits": [col,...]} meaning all literal columns (1 means satisfied) must be 1; OR
+      - {"rule_id": ..., "conds": [{"feat": col, "op": "==", "thr": val}, ...]}
+        meaning all equalities must hold (vectorized across rows).
+    """
+    n = len(ev_bin)
+    out_obj: np.ndarray = np.full(n, None, dtype=object)
+    remaining = np.ones(n, dtype=bool)
+
+    # Fast path: boolean literal columns
+    lit_cols = [c for c in ev_bin.columns if c.startswith(lit_prefix)]
+    E = ev_bin[lit_cols].astype("int8") if lit_cols else pd.DataFrame(index=ev_bin.index)
+
+    for r in rules:
+        if remaining.sum() == 0:
+            break
+        # normalize id
+        rid = r.get("id", r.get("rule_id", None))
+        if rid is None:
+            continue
+        mask = remaining.copy()
+        if "lits" in r and r["lits"]:
+            lits = [c for c in r["lits"] if c in E.columns]
+            if not lits:
+                continue
+            for c in lits:
+                mask &= (E[c].values == 1)
+                if not mask.any():
+                    break
+        elif "conds" in r and r["conds"]:
+            # Expect equality conditions on binned columns
+            for c in r["conds"]:
+                col = str(c.get("feat", ""))
+                op = str(c.get("op", "=="))
+                thr = c.get("thr", None)
+                if col not in ev_bin.columns or thr is None:
+                    mask &= False
+                    break
+                colv = pd.to_numeric(ev_bin[col], errors="coerce").to_numpy()
+                if op == "==":
+                    mask &= (colv == float(thr))
+                elif op == ">=":
+                    mask &= (colv >= float(thr))
+                elif op == "<=":
+                    mask &= (colv <= float(thr))
+                elif op == ">":
+                    mask &= (colv > float(thr))
+                elif op == "<":
+                    mask &= (colv < float(thr))
+                else:
+                    mask &= False
+                if not mask.any():
+                    break
+        else:
+            continue
+        idx = np.flatnonzero(mask)
+        if idx.size:
+            out_obj[idx] = rid
+            remaining[idx] = False
+    return pd.Series(out_obj, index=ev_bin.index, name="rule_id")
 
 
 def canonical_rule_id(conds: list[dict]) -> str:
@@ -66,8 +132,14 @@ def prepare_literal_buckets(df: pd.DataFrame, train_mask, rules_cfg: dict, featu
     if not auto:
         return work, []
     age_cfg = (features_cfg.get("age", {}) or {})
-    n_bins_feature = int(age_cfg.get("n_bins_feature", 5))
-    n_bins_cont = int(rules_cfg.get("n_bins_cont", n_bins_feature))
+    n_bins_feature = (age_cfg.get("n_bins_feature", 5))
+    nb_val = rules_cfg.get("n_bins_cont", None)
+    if isinstance(nb_val, str) and nb_val.lower() == "auto":
+        n_bins_cont = int(n_bins_feature or 5)
+    elif nb_val is None:
+        n_bins_cont = int(n_bins_feature or 5)
+    else:
+        n_bins_cont = int(nb_val)
     bin_cols = [c for c in work.columns if c.startswith("qbin_")]
     cont_cols = [c for c in work.columns if c.startswith(("since_", "occ_"))]
 
@@ -103,10 +175,30 @@ def ensure_artifacts(out_dir: Path) -> Path:
 
 def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
     '''Mine high-precision rules using Wilson LCB and per-month consistency.'''
-    rules_cfg = (cfg.get("rules") or {})
+    rules_cfg_in = (cfg.get("rules") or {})
     features_cfg = (cfg.get("features") or {})
     out_dir = Path(cfg.get("out_dir", "."))
     artifacts_dir = ensure_artifacts(out_dir)
+    # Small-sample fallback: relax thresholds and bins if too few resolved labels
+    try:
+        resolved_n = int(events[events["outcome"].isin(["win", "loss"])].shape[0])
+    except Exception:
+        resolved_n = 0
+    rules_cfg = dict(rules_cfg_in)
+    if resolved_n < 150:
+        print(f"[mining] small-sample mode: n_train_resolves={resolved_n} < 150 — relaxing thresholds", flush=True)
+        nb = rules_cfg.get("n_bins_cont", 5)
+        try:
+            nb = int(nb)
+        except Exception:
+            nb = 5
+        rules_cfg["n_bins_cont"] = max(3, min(5, nb))
+        rules_cfg["min_months"] = 1
+        rules_cfg["min_wins"] = 1
+        fdr_cfg = dict((rules_cfg.get("fdr", {}) or {}))
+        fdr_cfg["enabled"] = False
+        rules_cfg["fdr"] = fdr_cfg
+        rules_cfg["wilson_z"] = 1.64
 
     stats_columns = [
         "rule_id",
@@ -428,6 +520,21 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
 
     if not rule_stats:
         return emit_empty()
+
+    # --- FDR control (optional, on by default) ---
+    fdr_cfg = (cfg.get("rules", {}) or {}).get("fdr", {})
+    fdr_enable = bool(fdr_cfg.get("enabled", True))
+    alpha = float(fdr_cfg.get("alpha", 0.10))  # 10% FDR default
+
+    if fdr_enable and rule_stats:
+        # Build p-values from LCB vs baseline: conservative proxy
+        # pval ≈ 1 - LCB when baseline is ~0.5; for a stricter proxy use binomial test per rule.
+        keys = list(rule_stats.keys())
+        lcbs = np.array([rule_stats[k]["precision_lcb"] for k in keys], dtype=float)
+        pvals = 1.0 - np.clip(lcbs, 0.0, 1.0)
+        rejected, qvals = fdrcorrection(pvals, alpha=alpha, method="indep")
+        keep = set([k for k, r in zip(keys, rejected) if r])
+        rule_stats = {k: v for k, v in rule_stats.items() if k in keep}
 
     def conds_to_lits(conds: list[dict]) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []

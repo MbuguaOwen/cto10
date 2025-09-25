@@ -1,0 +1,81 @@
+﻿
+
+        dwell_ms=dwell_ms,
+
+
+        base_eta_for_time_scale=base_eta,
+
+
+        time_scale_clamp=clamp,
+
+
+        r_mult=r_mult,
+
+
+        show_progress=progress_on,
+
+
+    )
+
+
+    ev = ev.sort_values("ts").reset_index(drop=True)
+    ev = normalize_events_schema(ev)
+
+    ev.to_parquet(epath, index=False)
+
+
+    wins = int((ev["outcome"] == "win").sum())
+
+
+    losses = int((ev["outcome"] == "loss").sum())
+
+
+    timeouts = int((ev["outcome"] == "timeout").sum())
+
+
+    preempted = int(ev.get("preempted", pd.Series([], dtype=bool)).fillna(False).astype(bool).sum()) if len(ev) else 0
+    timeouts_nonpreempt = max(timeouts - preempted, 0)
+    _log(f"[{sym}] events: {len(ev)} (wins={wins}, losses={losses}, timeouts={timeouts})")
+    if preempted:
+        _log(f"[{sym}] events detail: preempted={preempted}, timeouts_nonpreempt={timeouts_nonpreempt}")
+
+    no_ticks_windows = int(ev.attrs.get("no_ticks_windows", 0))
+    _write_fingerprint(
+        artifacts_dir,
+        "tick_labeling",
+        cfg_path,
+        {
+            "train_months": list(train_months),
+            "test_months": list(test_months),
+            "events": int(len(ev)),
+            "wins": wins,
+            "losses": losses,
+            "timeouts": timeouts,
+            "preempted": preempted,
+            "timeouts_nonpreempt": timeouts_nonpreempt,
+            "no_ticks_windows": no_ticks_windows,
+            "tick_files": tick_file_info,
+        },
+    )
+
+
+def stage_mining(sym: str, train_months: List[str], test_months: List[str], cfg: Dict[str, Any], cfg_path: Path, fold_dir: Path, force: bool) -> None:
+
+
+    _log(f"[{sym}] mining: start train={train_months}")
+
+
+    apath = fold_dir / "artifacts" / "gating.json"
+
+
+    if skip_if_exists(apath, force):
+
+
+        _log(f"[{sym}] SKIP mining (exists)")
+
+
+        return
+
+
+    ensure_dir(fold_dir / "artifacts")
+

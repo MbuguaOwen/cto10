@@ -1,0 +1,101 @@
+﻿
+
+        ev["outcome_ts"] = ev["ts"]
+
+
+        ev["r1_ts"] = np.nan
+
+
+        ev["tp_ts"] = np.nan
+
+
+        ev = normalize_events_schema(ev)
+        ev.attrs["no_ticks_windows"] = len(ev)
+        ev.to_parquet(epath, index=False)
+
+
+        _log(f"[{sym}] events: {len(ev)} (wins=0, losses=0, timeouts={len(ev)})")
+
+
+        _write_fingerprint(
+            artifacts_dir,
+            "tick_labeling",
+            cfg_path,
+            {
+                "train_months": list(train_months),
+                "test_months": list(test_months),
+                "events": int(len(ev)),
+                "wins": 0,
+                "losses": 0,
+                "timeouts": int(len(ev)),
+                "preempted": 0,
+                "no_ticks_windows": int(len(ev)),
+                "tick_files": tick_file_info,
+            },
+        )
+
+
+        return
+
+
+    def _ticks_gen(files, tmin_ms, tmax_ms):
+
+
+        seq = _pbar(files, desc=f"{sym} ticks", enabled=progress_on, total=len(files))
+
+
+        for _, path in seq:
+
+
+            for chunk in stream_ticks_window(path, tmin_ms, tmax_ms):
+
+
+                yield chunk
+
+
+    ev = label_events_from_ticks(
+
+
+        cands=cands,
+
+
+        ticks_iterables=_ticks_gen(tick_files, tmin, tmax),
+
+
+        bar_seconds=bar_seconds,
+
+
+        horizon_hours=H_hours,
+
+
+        quick_hours=Q_hours,
+
+
+        non_overlap=non_overlap,
+
+
+        stop_band_atr=stop_band_atr,
+
+
+        consec_ticks=consec,
+
+
+        dwell_ms=dwell_ms,
+
+
+        base_eta_for_time_scale=base_eta,
+
+
+        time_scale_clamp=clamp,
+
+
+        r_mult=r_mult,
+
+
+        show_progress=progress_on,
+
+
+    )
+
+
+    ev = ev.sort_values("ts").reset_index(drop=True)

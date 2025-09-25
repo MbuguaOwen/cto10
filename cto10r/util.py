@@ -8,7 +8,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Iterable, Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -83,13 +83,61 @@ def safe_write(path, writer_fn):
     os.replace(tmp, str(path))
 
 
-def dump_json(obj, path: Path) -> None:
+def dump_json(obj: Any, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2)
 
-def exception_to_report(step, cfg_dict, out_dir, e):
+# --- NEW: IO schema normalizers ---
+
+def normalize_cands_schema(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "ts" in out.columns:
+        out["ts"] = pd.to_numeric(out["ts"], errors="coerce").astype("Int64")
+    num_cols: Iterable[str] = ["entry", "level", "risk_dist", "eta", "atr", "open", "high", "low", "close", "close_to_hi_atr", "close_to_lo_atr"]
+    for c in num_cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
+    if "side" in out.columns:
+        out["side"] = out["side"].astype("string")
+    out = out.loc[:, ~out.columns.duplicated()]
+    return out
+
+
+def normalize_events_schema(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    ts_cols: Iterable[str] = ["ts", "outcome_ts", "r1_ts", "tp_ts"]
+    for c in ts_cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype("Int64")
+    if "outcome" in out.columns:
+        out["outcome"] = out["outcome"].astype("string")
+    if "preempted" in out.columns:
+        out["preempted"] = out["preempted"].fillna(False).astype(bool)
+    join_num: Iterable[str] = ["entry", "level", "risk_dist"]
+    for c in join_num:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
+    if "side" in out.columns:
+        out["side"] = out["side"].astype("string")
+    out = out.loc[:, ~out.columns.duplicated()]
+    return out
+
+
+def ensure_parquet_engine() -> None:
+    try:
+        import pyarrow  # noqa: F401
+        return
+    except Exception:
+        try:
+            import fastparquet  # noqa: F401
+            return
+        except Exception:
+            raise ImportError("No Parquet engine found. Please install pyarrow or fastparquet before running.")
+
+
+def exception_to_report(step, cfg_dict, out_dir, e) -> Dict[str, Any]:
     rep = {
         "step": step,
         "exception": str(type(e).__name__),

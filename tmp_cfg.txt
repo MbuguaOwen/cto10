@@ -68,41 +68,40 @@ candidates:
     thinning:
       type: cusum_by_ret
       params:
-        ret_lookback: 480     # was 240; longer memory -> fewer, more meaningful flips
-        k_sigma: 1.8          # moderate sensitivity (don't over-thin to 5)
+        ret_lookback: 360
+        k_sigma: 1.6
         drift: 0.0
-        min_gap_bars: 360     # 6h quick window x 60 bars/h (for 1m bars)
+        min_gap_bars: 0            # no quick-window dedupe in research
         fallback_stride_k: 0
     sides: both
   vol_prefilter:
-    column: atr_p             # causal, train-fit percentile (keep percentiles_fit_on: train)
-    min_percentile: 55        # only label in higher-volatility regimes
+    column: atr_p
+    min_percentile: 65
 
 labels:
   r_mult: 5
-  horizon_hours: 480          # was 240 â€” give trades time to resolve
-  quick_ignition_hours: 6
-  non_overlap: true
-  non_overlap_policy: quick
+  horizon_hours: 480
+  non_overlap: true               # âœ… one position at a time
+  non_overlap_policy: to_exit     # âœ… busy until the current trade exits
+  quick_ignition_hours: 0         # ignored with policy=to_exit
   intra_bar_epsilon_ms: 1
   min_risk_atr_frac: 0.001
   eta_atr: 15.0
   eta_by_atr_p:
-    - [0, 35, 1.50]
-    - [35, 65, 5.00]
-    - [65, 85, 10.00]
-    - [85, 95, 15.00]
+    - [0, 35, 7.50]
+    - [35, 65, 12.00]
+    - [65, 85, 15.00]
+    - [85, 95, 18.00]
     - [95, 101, 20.00]
-  eta_cap: { min: 0.50, max: 6.00 }
+  eta_cap: { min: 7.50, max: 20.00 }
   time_scale_from_eta: { base_eta: 0.30, clamp: [0.75, 10.0] }
-  stop_band_atr: 0.05         # converts drift to resolved exits (small, realistic)
-  consec_ticks: 1
-  dwell_ms: 0
+  stop_band_atr: 0.05
+  no_ticks_policy: skip           # data gaps â†’ admin (excluded from training)
 
 mining:
   rules:
     auto_binning: true
-    n_bins_cont: auto
+    n_bins_cont: 5                # avoid over-fragmentation with small n
     max_terms: 2
     top_k: 60
     min_support_frac: 0.001
@@ -111,10 +110,31 @@ mining:
     wilson_z: 1.96
     mine_losers: true
     loser_top_k: 8
-    loser_max_precision_ucb: 0.35   # <-- ensure nothing follows this number
+    loser_max_precision_ucb: 0.35
     loser_min_resolve_frac: 0.40
     loser_min_months: 2
-    fdr:
-      enabled: true
-      alpha: 0.10
+    fdr: { enabled: true, alpha: 0.10 }
 
+loser_mask:
+  enabled: true
+  min_support: 20
+  min_months_with_lift: 2
+  min_ppv_lcb: 0.55
+  save_artifact: true
+
+# Gate parameters consumed by walkforward (and echoed inside ml_gating)
+gate:
+  mode: ml
+  calibration: isotonic
+  target_ppv_lcb: 0.60
+  min_coverage: 0.02
+  val_months: 1
+  crosses_cap: 30
+
+# ML gating / feature controls
+ml_gating:
+  enabled: true
+  model: logreg               # logreg | gbdt
+  calibration: isotonic
+  target_ppv_lcb: 0.60
+  min_coverage: 0.02

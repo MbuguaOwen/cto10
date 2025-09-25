@@ -7,14 +7,17 @@ from __future__ import annotations
 import argparse
 
 
+import hashlib
 import json
-
-
+import os
+import random
 import shutil
 import copy
+import sys
 
 
 from dataclasses import dataclass
+import math
 
 
 from pathlib import Path
@@ -39,7 +42,16 @@ from tqdm.auto import tqdm
 from .io_utils import ensure_dir, write_json, skip_if_exists
 
 
-from .util import exception_to_report, infer_bar_seconds, safe_div, dump_json, wilson_lcb
+from .util import (
+    exception_to_report,
+    infer_bar_seconds,
+    safe_div,
+    dump_json,
+    normalize_cands_schema,
+    normalize_events_schema,
+    ensure_parquet_engine,
+    wilson_lcb,
+)
 
 
 from .bars import load_bars_any, build_features, fit_percentiles, apply_percentiles, add_age_features, add_nonlinear_features
@@ -51,7 +63,7 @@ from .candidates import build_candidates_router
 from .ticks import iter_ticks_files, stream_ticks_window, label_events_from_ticks
 
 
-from .mining import mine_rules, prepare_literal_buckets
+from .mining import mine_rules, prepare_literal_buckets, match_rules_vectorized
 from .ml import schedule_non_overlapping
 from .gate import (
     GateConfig,
@@ -66,33 +78,73 @@ from .gate import (
 
 
 RULE_FINGERPRINT_FEATURES = [
-
-
     "t_240", "t_60", "t_15",
-
-
     "accel_15_240",
-
-
     "body_dom",
-
-
-    "close_to_ext_atr",
-
-
+    "close_to_hi_atr",  # directional, replaces close_to_ext_atr
+    "close_to_lo_atr",  # directional, replaces close_to_ext_atr
     "atr_p", "dcw_p",
-
-
     "eta",
-
-
     "ym",
-
-
 ]
 
 
 ALL_STAGES = ["features", "tick_labeling", "mining", "simulate"]
+
+
+# ------------------------ fingerprints ------------------------
+
+
+def _sha256_path(p: Path) -> str:
+    try:
+        with open(p, 'rb') as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except Exception:
+        return ''
+
+
+def _sha256_text(txt: str) -> str:
+    return hashlib.sha256(txt.encode('utf-8')).hexdigest()
+
+
+def _write_fingerprint(out_dir: Path, stage: str, cfg_path: Path, extra: dict) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fp = {
+        'stage': stage,
+        'python': sys.version,
+        'numpy': np.__version__,
+        'pandas': pd.__version__,
+        'cfg_path': str(cfg_path),
+        'cfg_sha256': _sha256_path(cfg_path),
+        'code': {
+            'ticks.py': _sha256_path(Path(__file__).parent / 'ticks.py'),
+            'walkforward.py': _sha256_path(Path(__file__)),
+            'util.py': _sha256_path(Path(__file__).parent / 'util.py'),
+        },
+    }
+    if extra:
+        fp.update(extra)
+    (out_dir / f'run_fingerprint_{stage}.json').write_text(json.dumps(fp, indent=2))
+
+
+def _describe_paths(paths: Iterable[Path | str]) -> List[Dict[str, Any]]:
+    info: List[Dict[str, Any]] = []
+    for raw in paths:
+        p = Path(raw)
+        entry: Dict[str, Any] = {'path': str(p)}
+        try:
+            stat = p.stat()
+            entry.update({'size': stat.st_size, 'mtime': stat.st_mtime, 'sha256': _sha256_path(p)})
+        except Exception:
+            pass
+        info.append(entry)
+    return info
+
+
+def _seed_determinism() -> None:
+    os.environ.setdefault('PYTHONHASHSEED', '0')
+    random.seed(42)
+    np.random.seed(42)
 
 
 # ------------------------ small utils ------------------------
@@ -227,36 +279,11 @@ def rule_hit_row(row: pd.Series, conds: List[Dict[str, Any]]) -> bool:
 
 
 def assign_best_rule_id(df: pd.DataFrame, rules: List[Dict[str, Any]]) -> pd.Series:
-
-
-    out = pd.Series([None]*len(df), index=df.index, dtype="object")
-
-
-    for r in rules:
-
-
-        rid = r.get("rule_id"); conds = r.get("conds", [])
-
-
-        if rid is None or not conds: 
-
-
-            continue
-
-
-        mask = df.apply(lambda row: rule_hit_row(row, conds), axis=1)
-
-
-        out.loc[mask & out.isna()] = rid
-
-
-        if out.notna().all():
-
-
-            break
-
-
-    return out
+    # Vectorized first-hit matching using rule conditions
+    if df.empty or not rules:
+        return pd.Series([None] * len(df), index=df.index, dtype="object")
+    ser = match_rules_vectorized(df, rules, lit_prefix="B_")
+    return ser
 
 
 # ------------------------ CLI ------------------------
@@ -334,10 +361,23 @@ def parse_args() -> Args:
 def load_cfg(path: str) -> Dict[str, Any]:
 
 
-    with open(path, "r") as f:
+    try:
 
 
-        return yaml.safe_load(f)
+        with open(path, "r", encoding="utf-8") as f:
+
+
+            return yaml.safe_load(f)
+
+
+    except UnicodeDecodeError:
+
+
+        # Some editors save UTF-8 with BOM; yaml can read it fine if we decode with utf-8-sig
+        with open(path, "r", encoding="utf-8-sig") as f:
+
+
+            return yaml.safe_load(f)
 
 
 def stages_to_run(only: Optional[str], from_stage: Optional[str], until_stage: Optional[str]) -> List[str]:
@@ -407,6 +447,7 @@ def _load_bars_months(sym: str, months: List[str], data_cfg: Dict[str, Any], bar
 
 
     dfs: List[pd.DataFrame] = []
+    files_used: List[str] = []
 
 
     for p in _pbar(paths, desc=f"{sym} bars", enabled=progress_on, total=len(paths)):
@@ -422,15 +463,19 @@ def _load_bars_months(sym: str, months: List[str], data_cfg: Dict[str, Any], bar
 
 
         dfs.append(df)
+        files_used.append(str(p))
 
 
     if not dfs:
 
 
-        return pd.DataFrame(columns=["ts","open","high","low","close","ym"])
+        bars = pd.DataFrame(columns=["ts","open","high","low","close","ym"])
+        bars.attrs["files_used"] = files_used
+        return bars
 
 
     bars = pd.concat(dfs, ignore_index=True).sort_values("ts")
+    bars.attrs["files_used"] = files_used
 
 
     # derive ym (YYYY-MM) from timestamp (ms)
@@ -448,7 +493,7 @@ def _load_bars_months(sym: str, months: List[str], data_cfg: Dict[str, Any], bar
 # ------------------------ stages ------------------------
 
 
-def stage_features(sym: str, train_months: List[str], test_months: List[str], cfg: Dict[str, Any], fold_dir: Path, force: bool) -> None:
+def stage_features(sym: str, train_months: List[str], test_months: List[str], cfg: Dict[str, Any], cfg_path: Path, fold_dir: Path, force: bool) -> None:
 
 
     _log(f"[{sym}] features: start train={train_months} test={test_months}")
@@ -456,6 +501,9 @@ def stage_features(sym: str, train_months: List[str], test_months: List[str], cf
 
     ensure_dir(fold_dir)
 
+
+    artifacts_dir = fold_dir / "artifacts"
+    ensure_dir(artifacts_dir)
 
     cfg_echo = fold_dir / "cfg_echo.json"
 
@@ -467,6 +515,9 @@ def stage_features(sym: str, train_months: List[str], test_months: List[str], cf
 
 
     cpath = fold_dir / "candidates.parquet"
+
+
+    ensure_parquet_engine()
 
 
     if skip_if_exists(cpath, force):
@@ -496,8 +547,22 @@ def stage_features(sym: str, train_months: List[str], test_months: List[str], cf
     if bars.empty:
 
 
-        pd.DataFrame().to_parquet(cpath, index=False)
+        empty = normalize_cands_schema(pd.DataFrame())
+        empty.to_parquet(cpath, index=False)
 
+        bar_files_info = _describe_paths(bars.attrs.get("files_used", []))
+        _write_fingerprint(
+            artifacts_dir,
+            "features",
+            cfg_path,
+            {
+                "train_months": list(train_months),
+                "test_months": list(test_months),
+                "bars_rows": 0,
+                "candidates_rows": 0,
+                "bar_files": bar_files_info,
+            },
+        )
 
         _log(f"[{sym}] features: candidates=0 (no bars)")
 
@@ -573,12 +638,35 @@ def stage_features(sym: str, train_months: List[str], test_months: List[str], cf
 
     feat_all = add_age_features(feat_all, cfg, train_months, fold_dir)
 
+    # Compat: derive close_to_ext_atr if someone expects it
+    if "close_to_ext_atr" not in feat_all.columns:
+        if {"t_240", "close_to_hi_atr", "close_to_lo_atr"}.issubset(feat_all.columns):
+            t_240_numeric = pd.to_numeric(feat_all["t_240"], errors="coerce")
+            hi_atr = pd.to_numeric(feat_all["close_to_hi_atr"], errors="coerce")
+            lo_atr = pd.to_numeric(feat_all["close_to_lo_atr"], errors="coerce")
+            feat_all["close_to_ext_atr"] = np.where(t_240_numeric >= 0, hi_atr, lo_atr)
+
     cands = build_candidates_router(feat_all, cfg)
 
 
     cands = cands.sort_values("ts").reset_index(drop=True)
     # Drop duplicate columns to keep PyArrow happy
     cands = cands.loc[:, ~cands.columns.duplicated()]
+    cands = normalize_cands_schema(cands)
+
+    bar_files_info = _describe_paths(bars.attrs.get("files_used", []))
+    _write_fingerprint(
+        artifacts_dir,
+        "features",
+        cfg_path,
+        {
+            "train_months": list(train_months),
+            "test_months": list(test_months),
+            "bars_rows": int(len(bars)),
+            "candidates_rows": int(len(cands)),
+            "bar_files": bar_files_info,
+        },
+    )
 
     cands.to_parquet(cpath, index=False)
 
@@ -586,13 +674,19 @@ def stage_features(sym: str, train_months: List[str], test_months: List[str], cf
     _log(f"[{sym}] features: candidates={len(cands)}")
 
 
-def stage_tick_labeling(sym: str, train_months: List[str], test_months: List[str], cfg: Dict[str, Any], fold_dir: Path, force: bool) -> None:
+def stage_tick_labeling(sym: str, train_months: List[str], test_months: List[str], cfg: Dict[str, Any], cfg_path: Path, fold_dir: Path, force: bool) -> None:
 
 
     _log(f"[{sym}] tick_labeling: start")
 
 
+    artifacts_dir = fold_dir / "artifacts"
+    ensure_dir(artifacts_dir)
+
     epath = fold_dir / "events.parquet"
+
+
+    ensure_parquet_engine()
 
 
     if skip_if_exists(epath, force):
@@ -604,27 +698,79 @@ def stage_tick_labeling(sym: str, train_months: List[str], test_months: List[str
         return
 
 
-    cands = pd.read_parquet(fold_dir / "candidates.parquet")
+    # Friendly guard: require features stage to exist
+    cpath = fold_dir / "candidates.parquet"
+    if not cpath.exists():
+        raise FileNotFoundError(
+            f"{cpath} not found. Run features stage first:\n"
+            f"  python -m cto10r --config {cfg_path} --mode walkforward --only features --force"
+        )
+    cands = pd.read_parquet(cpath)
+    # Fast labeling cap for debugging (optional)
+    import os as _os
+    cap = int(_os.getenv("LABEL_MAX", "0") or "0")
+    if cap > 0:
+        cands = cands.sort_values("ts").head(cap).copy()
+        _log(f"[debug] LABEL_MAX={cap} → cands={len(cands)}")
+
+    # Volatility prefilter intentionally disabled (vol_prefilter: null)
+    _log(f"[{sym}] prefilter: disabled")
 
 
     if cands.empty:
 
 
-        pd.DataFrame(columns=["ts", "side", "entry", "level", "risk_dist", "outcome"]).to_parquet(epath, index=False)
+        empty_events = pd.DataFrame(columns=["ts", "side", "entry", "level", "risk_dist", "outcome"])
+        empty_events = normalize_events_schema(empty_events)
+        empty_events.attrs["no_ticks_windows"] = 0
+        empty_events.to_parquet(epath, index=False)
 
 
         _log(f"[{sym}] events: 0 (no candidates)")
 
 
+        _write_fingerprint(
+            artifacts_dir,
+            "tick_labeling",
+            cfg_path,
+            {
+                "train_months": list(train_months),
+                "test_months": list(test_months),
+                "events": 0,
+                "wins": 0,
+                "losses": 0,
+                "timeouts": 0,
+                "preempted": 0,
+                "no_ticks_windows": 0,
+                "tick_files": tick_file_info,
+            },
+        )
+
+
         return
 
 
-    cands = cands.sort_values("ts").reset_index(drop=True)
+    # One-per-side per quick ignition window (dedupe at candidate stage to reduce admin preempts)
+    qh_ms = int(float(cfg["labels"].get("quick_ignition_hours", 6)) * 3600_000)
+    cands = cands.sort_values(["side", "ts"]).reset_index(drop=True)
+    _keep = []
+    last_ts = {"long": -10**18, "short": -10**18}
+    for _, row in cands.iterrows():
+        s = str(row["side"]).lower()
+        t = int(row["ts"])
+        if t - last_ts.get(s, -10**18) >= qh_ms:
+            _keep.append(True)
+            last_ts[s] = t
+        else:
+            _keep.append(False)
+    _before = len(cands)
+    cands = cands.loc[_keep].copy()
+    _log(f"[{sym}] dedupe[quick={qh_ms//3600000}h]: kept {len(cands)}/{_before} ({len(cands)/max(1,_before):.1%})")
 
 
     _log(f"[{sym}] tick_labeling: candidates={len(cands)}")
 
-
+    tick_file_info: List[Dict[str, Any]] = []
     months_all = list(dict.fromkeys(train_months + test_months))
 
 
@@ -662,6 +808,11 @@ def stage_tick_labeling(sym: str, train_months: List[str], test_months: List[str
 
 
     r_mult = float(labels_cfg.get("r_mult", 10.0))
+    # Policy and epsilon for tick labeling
+    non_overlap_policy = str(labels_cfg.get("non_overlap_policy", "quick"))
+    intra_eps_ms = int(labels_cfg.get("intra_bar_epsilon_ms", 1))
+    min_risk_atr_frac = float(labels_cfg.get("min_risk_atr_frac", 0.001))
+    no_ticks_policy = str(labels_cfg.get("no_ticks_policy", "timeout"))
 
 
     ts_cfg = labels_cfg.get("time_scale_from_eta")
@@ -722,7 +873,16 @@ def stage_tick_labeling(sym: str, train_months: List[str], test_months: List[str
 
 
     tick_files = list(iter_ticks_files(ticks_dir, sym, months_all, patt))
-
+    tick_file_info = []
+    for ym, path_obj in tick_files:
+        entry = {"ym": ym, "path": str(path_obj)}
+        try:
+            stat = Path(path_obj).stat()
+            entry.update({"size": stat.st_size, "mtime": stat.st_mtime, "sha256": _sha256_path(Path(path_obj))})
+        except Exception:
+            pass
+        tick_file_info.append(entry)
+    print(f"[ticks] files: {len(tick_files)} files for {sym} {test_months}")
 
     progress_on = bool(cfg.get("io", {}).get("progress", True))
 
@@ -745,10 +905,30 @@ def stage_tick_labeling(sym: str, train_months: List[str], test_months: List[str
         ev["tp_ts"] = np.nan
 
 
+        ev = normalize_events_schema(ev)
+        ev.attrs["no_ticks_windows"] = len(ev)
         ev.to_parquet(epath, index=False)
 
 
         _log(f"[{sym}] events: {len(ev)} (wins=0, losses=0, timeouts={len(ev)})")
+
+
+        _write_fingerprint(
+            artifacts_dir,
+            "tick_labeling",
+            cfg_path,
+            {
+                "train_months": list(train_months),
+                "test_months": list(test_months),
+                "events": int(len(ev)),
+                "wins": 0,
+                "losses": 0,
+                "timeouts": int(len(ev)),
+                "preempted": 0,
+                "no_ticks_windows": int(len(ev)),
+                "tick_files": tick_file_info,
+            },
+        )
 
 
         return
@@ -809,13 +989,17 @@ def stage_tick_labeling(sym: str, train_months: List[str], test_months: List[str
 
 
         show_progress=progress_on,
+        policy=non_overlap_policy,
+        intra_eps_ms=intra_eps_ms,
+        min_risk_frac=min_risk_atr_frac,
+        no_ticks_policy=no_ticks_policy,
 
 
     )
 
 
     ev = ev.sort_values("ts").reset_index(drop=True)
-
+    ev = normalize_events_schema(ev)
 
     ev.to_parquet(epath, index=False)
 
@@ -829,10 +1013,39 @@ def stage_tick_labeling(sym: str, train_months: List[str], test_months: List[str
     timeouts = int((ev["outcome"] == "timeout").sum())
 
 
+    preempted = int(ev.get("preempted", pd.Series([], dtype=bool)).fillna(False).astype(bool).sum()) if len(ev) else 0
+    timeouts_nonpreempt = max(timeouts - preempted, 0)
     _log(f"[{sym}] events: {len(ev)} (wins={wins}, losses={losses}, timeouts={timeouts})")
+    _log(f"[{sym}] events detail: preempted={preempted}, timeouts_nonpreempt={timeouts_nonpreempt}")
+
+    no_ticks_windows = int(ev.attrs.get("no_ticks_windows", 0))
+    # Tripwires for data quality
+    bad_ticks_thr = 0.10  # 10% default
+    if no_ticks_windows / max(len(ev), 1) > bad_ticks_thr:
+        _log(f"[{sym}] WARNING: no-ticks windows > {bad_ticks_thr*100:.0f}% — data gaps may bias outcomes")
+    fallback_risk_count = int(ev.attrs.get("fallback_risk_count", 0))
+    if fallback_risk_count > 0:
+        _log(f"[{sym}] INFO: applied ATR-based risk fallback {fallback_risk_count} times")
+    _write_fingerprint(
+        artifacts_dir,
+        "tick_labeling",
+        cfg_path,
+        {
+            "train_months": list(train_months),
+            "test_months": list(test_months),
+            "events": int(len(ev)),
+            "wins": wins,
+            "losses": losses,
+            "timeouts": timeouts,
+            "preempted": preempted,
+            "timeouts_nonpreempt": timeouts_nonpreempt,
+            "no_ticks_windows": no_ticks_windows,
+            "tick_files": tick_file_info,
+        },
+    )
 
 
-def stage_mining(sym: str, train_months: List[str], test_months: List[str], cfg: Dict[str, Any], fold_dir: Path, force: bool) -> None:
+def stage_mining(sym: str, train_months: List[str], test_months: List[str], cfg: Dict[str, Any], cfg_path: Path, fold_dir: Path, force: bool) -> None:
 
 
     _log(f"[{sym}] mining: start train={train_months}")
@@ -853,7 +1066,14 @@ def stage_mining(sym: str, train_months: List[str], test_months: List[str], cfg:
     ensure_dir(fold_dir / "artifacts")
 
 
-    cands = pd.read_parquet(fold_dir / "candidates.parquet")
+    # Friendly guard: require features stage to exist
+    cpath = fold_dir / "candidates.parquet"
+    if not cpath.exists():
+        raise FileNotFoundError(
+            f"{cpath} not found. Run features stage first:\n"
+            f"  python -m cto10r --config {cfg_path} --mode walkforward --only features --force"
+        )
+    cands = pd.read_parquet(cpath)
 
 
     events = pd.read_parquet(fold_dir / "events.parquet")
@@ -890,6 +1110,9 @@ def stage_mining(sym: str, train_months: List[str], test_months: List[str], cfg:
 
 
     events_tr = _norm_keys(events_tr)
+
+    if "preempted" in events_tr.columns:
+        events_tr = events_tr[~events_tr["preempted"].astype(bool)].copy()
 
 
     rules_cfg = cfg.get("mining", {}).get("rules", {})
@@ -967,6 +1190,15 @@ def stage_mining(sym: str, train_months: List[str], test_months: List[str], cfg:
         val_df = all_train.copy()
 
     artifacts_dir = fold_dir / "artifacts"
+    gate_summary = {
+        "tau": float("nan"),
+        "ppv": float("nan"),
+        "ppv_lcb": float("nan"),
+        "coverage": float("nan"),
+        "loser_rules": 0,
+    }
+    gate_summary_path = artifacts_dir / "gate_summary.json"
+    diag: Dict[str, Any] = {}
 
     if len(train_core) and train_core["y"].nunique() > 1:
         try:
@@ -980,26 +1212,59 @@ def stage_mining(sym: str, train_months: List[str], test_months: List[str], cfg:
                 artifacts_dir,
             )
             _log(
-                f"[{sym}] gate: τ={diag['tau']:.4f} PPV={diag['ppv']:.3f} LCB={diag['ppv_lcb']:.3f} cov={diag['cov']:.3f} loser_rules={diag['loser_rules']}"
+                f"[{sym}] gate: tau={diag['tau']:.4f} PPV={diag['ppv']:.3f} LCB={diag['ppv_lcb']:.3f} cov={diag['cov']:.3f} loser_rules={diag['loser_rules']}"
             )
+            gate_summary.update({
+                "tau": float(diag.get("tau", float("nan"))),
+                "ppv": float(diag.get("ppv", float("nan"))),
+                "ppv_lcb": float(diag.get("ppv_lcb", float("nan"))),
+                "coverage": float(diag.get("cov", float("nan"))),
+                "loser_rules": int(diag.get("loser_rules", 0)),
+            })
         except Exception as e:
             _log(f"[{sym}] gate training failed: {e}")
     else:
         _log(f"[{sym}] gate: insufficient labeled data for training (rows={len(train_core)})")
 
+    write_json(gate_summary_path, gate_summary)
 
-def stage_simulate(
-    sym: str,
-    train_months: List[str],
-    test_months: List[str],
-    cfg: Dict[str, Any],
-    fold_dir: Path,
-    force: bool,
-    fold_idx: Optional[int] = None,
-) -> None:
+    _write_fingerprint(
+        artifacts_dir,
+        "mining",
+        cfg_path,
+        {
+            "train_months": list(train_months),
+            "test_months": list(test_months),
+            "cands_train_rows": int(len(cands_tr)),
+            "events_train_rows": int(len(events_tr)),
+            "train_samples": int(len(all_train)),
+            "promoted": len(promoted),
+            "rules_total": len(mining_payload.get("rules", [])),
+            "tau": gate_summary.get("tau"),
+            "ppv": gate_summary.get("ppv"),
+            "ppv_lcb": gate_summary.get("ppv_lcb"),
+            "coverage": gate_summary.get("coverage"),
+            "loser_rules": gate_summary.get("loser_rules"),
+        },
+    )
+
+
+def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cfg: Dict[str, Any], cfg_path: Path, fold_dir: Path, force: bool) -> None:
 
 
     _log(f"[{sym}] simulate: start test={test_months}")
+
+
+    prog_cfg = (cfg.get("progress", {}) or {}).get("sim", {}) or {}
+    show_inner = bool(prog_cfg.get("inner_schedule_bar", False))
+    desc_inner = str(prog_cfg.get("schedule_desc", "schedule"))
+    upd_every = int(prog_cfg.get("schedule_update_every", 1000))
+
+    sched_cfg = (cfg.get("execution_sim", {}) or {}).get("scheduler", {}) or {}
+    weight_mode = str(sched_cfg.get("weight_mode", "expR"))
+    sched_r_mult = float(sched_cfg.get("r_mult", 5.0))
+    timeout_sec = sched_cfg.get("timeout_sec", None)
+    timeout_sec = float(timeout_sec) if timeout_sec is not None else None
 
 
     spath = fold_dir / "stats.json"
@@ -1020,7 +1285,14 @@ def stage_simulate(
         return
 
 
-    cands = pd.read_parquet(fold_dir / "candidates.parquet")
+    # Friendly guard: require features stage to exist
+    cpath = fold_dir / "candidates.parquet"
+    if not cpath.exists():
+        raise FileNotFoundError(
+            f"{cpath} not found. Run features stage first:\n"
+            f"  python -m cto10r --config {cfg_path} --mode walkforward --only features --force"
+        )
+    cands = pd.read_parquet(cpath)
 
 
     events = pd.read_parquet(fold_dir / "events.parquet")
@@ -1080,8 +1352,8 @@ def stage_simulate(
 
     literal_cols = [c for c in cands_t_norm.columns if c.startswith("B_")]
     age_cols = [c for c in cands_t_norm.columns if c.startswith("qbin_agebin_")]
-    merge_cols = list(dict.fromkeys(join_cols + feature_cols + literal_cols + age_cols))
-
+    merge_cols = list(dict.fromkeys([*join_cols, *feature_cols, *literal_cols, *age_cols]))
+    merge_cols = [c for c in merge_cols if c in cands_t_norm.columns]
 
     if not ev.empty:
 
@@ -1133,8 +1405,13 @@ def stage_simulate(
     )
     ev["p_win"] = pd.to_numeric(ev["p_win"], errors="coerce")
     ev["loser_mask"] = ev["loser_mask"].fillna(False)
-    ev["enter"] = ev["enter"].fillna(False)
     ev["tau_used"] = ev["tau_used"].fillna(gate_tau)
+
+    if "preempted" not in ev.columns:
+        ev["preempted"] = False
+    ev["preempted"] = ev["preempted"].fillna(False).astype(bool)
+
+    ev["enter"] = ev["enter"].fillna(False) & (~ev["preempted"])
 
     ev = ev.sort_values("ts").reset_index(drop=True)
 
@@ -1148,15 +1425,17 @@ def stage_simulate(
 
     label_merge_cols = [c for c in join_cols if c in decision_df.columns and c in ev.columns]
     if label_merge_cols:
-        label_lookup = ev[label_merge_cols + ["outcome"]].copy()
+        extra_cols = ["preempted"] if "preempted" in ev.columns else []
+        label_lookup = ev[label_merge_cols + ["outcome"] + extra_cols].copy()
         label_lookup["label_resolved"] = label_lookup["outcome"].map({
             "win": 1,
             "loss": -1,
             "timeout": 0,
         })
         label_lookup = label_lookup.drop_duplicates(subset=label_merge_cols, keep="last")
+        merge_cols = label_merge_cols + ["label_resolved"] + extra_cols
         decision_df = decision_df.merge(
-            label_lookup[label_merge_cols + ["label_resolved"]],
+            label_lookup[merge_cols],
             on=label_merge_cols,
             how="left",
         )
@@ -1170,9 +1449,14 @@ def stage_simulate(
             decision_df.get("label", pd.Series(np.nan, index=decision_df.index)),
             errors="coerce",
         )
+        if "preempted" not in decision_df.columns:
+            decision_df["preempted"] = False
 
     decision_df["label"] = pd.to_numeric(decision_df["label"], errors="coerce")
-    decision_df["enter"] = go_series.to_numpy()
+    if "preempted" not in decision_df.columns:
+        decision_df["preempted"] = False
+    decision_df["preempted"] = decision_df["preempted"].fillna(False).astype(bool)
+    decision_df["enter"] = go_series.to_numpy() & (~decision_df["preempted"].to_numpy())
 
     tau_series = pd.to_numeric(decision_df.get("tau_used", pd.Series([], dtype=float)), errors="coerce").dropna()
     if len(tau_series):
@@ -1248,21 +1532,78 @@ def stage_simulate(
     coverage = decided_cov if total_candidates else (float(ev["enter"].mean()) if len(ev) else 0.0)
     empirical_ppv = ppv_resolved if resolved else float("nan")
     ppv_str = f"{empirical_ppv:.3f}" if empirical_ppv == empirical_ppv else "nan"
-    _log(f"[sim] decided_cov={coverage:.3f} decided_empirical_ppv={ppv_str}")
+    tau_str = f"{tau_used_val:.3f}" if tau_used_val == tau_used_val else "nan"
+    _log(f"[sim] tau_used={tau_str} decided_cov={coverage:.3f} decided_empirical_ppv={ppv_str}")
 
-    total = int(len(ev))
-    wins_all = int((ev["outcome"] == "win").sum())
-    losses_all = int((ev["outcome"] == "loss").sum())
-    timeouts_all = int((ev["outcome"] == "timeout").sum())
+    ev_all = ev[~ev["preempted"]].copy()
+    preempted_total = int(ev["preempted"].sum())
+    total = int(len(ev_all))
+    wins_all = int((ev_all["outcome"] == "win").sum())
+    losses_all = int((ev_all["outcome"] == "loss").sum())
+    timeouts_all = int((ev_all["outcome"] == "timeout").sum())
     denom_all = max(wins_all + losses_all, 1)
     wr_all = wins_all / denom_all if denom_all else 0.0
     expR_all = wr_all * label_r_mult + (1.0 - wr_all) * (-1.0)
 
-    trades = ev[ev["outcome"].isin(["win", "loss"])].copy()
-    trades["R"] = np.where(trades["outcome"] == "win", label_r_mult, -1.0)
-    trades.to_csv(tpath, index=False)
+    # --- PREEMPT robustness: tolerate missing column ---
+    if "preempted" not in ev.columns:
+        ev["preempted"] = False
 
-    cands_t_norm.to_csv(trpath, index=False)
+    # --- Compute gross R same as before ---
+    trades = ev[ev["outcome"].isin(["win", "loss"])].copy()
+    trades["R_gross"] = np.where(trades["outcome"] == "win", label_r_mult, -1.0)
+
+    # --- Fees & Funding config (live-parity) ---
+    fees_cfg = (cfg.get("execution_sim", {}) or {}).get("fees", {}) or {}
+    fund_cfg = (cfg.get("execution_sim", {}) or {}).get("funding", {}) or {}
+
+    maker = float(fees_cfg.get("maker_bps", 0.0)) / 1e4
+    taker = float(fees_cfg.get("taker_bps", 0.0)) / 1e4
+    # Assume taker entry, maker exit by default (common on perps); allow override
+    entry_is_maker = bool(fees_cfg.get("entry_is_maker", False))
+    exit_is_maker  = bool(fees_cfg.get("exit_is_maker", True))
+
+    fee_entry = maker if entry_is_maker else taker
+    fee_exit  = maker if exit_is_maker  else taker
+    roundtrip_fee = float(fees_cfg.get("roundtrip_bps", 0.0)) / 1e4
+    if roundtrip_fee > 0.0:
+        # If explicit roundtrip set, override split
+        fee_entry = roundtrip_fee / 2.0
+        fee_exit  = roundtrip_fee / 2.0
+
+    # Funding settings
+    fund_enabled = bool(fund_cfg.get("enabled", False))
+    fund_per_hour = float(fund_cfg.get("rate_per_hour", 0.0))  # e.g. 0.0001 for 1bp/hr
+    fund_sign = float(fund_cfg.get("sign", 1.0))  # +1 cost for longs by default; set -1 if your venue credits longs
+
+    # --- Convert costs to R-units using entry and risk distance ---
+    # R-unit = price move equal to risk_dist. Fee in R = (fee * entry_price) / risk_dist.
+    # This cancels quantity. We guard zeros/NaNs with eps.
+    eps = 1e-12
+    entry = pd.to_numeric(trades.get("entry"), errors="coerce")
+    risk  = pd.to_numeric(trades.get("risk_dist"), errors="coerce").abs()
+    leverage = (entry / np.maximum(risk, eps)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    fee_R = leverage * (fee_entry + fee_exit)
+
+    # --- Funding proration by time in position ---
+    if fund_enabled:
+        t_start = pd.to_numeric(trades.get("ts"), errors="coerce")
+        t_end   = pd.to_numeric(trades.get("outcome_ts"), errors="coerce")
+        hours   = ((t_end - t_start).astype(float) / 3600.0).clip(lower=0.0)
+        funding_R = leverage * fund_per_hour * hours * fund_sign
+    else:
+        funding_R = 0.0
+
+    trades["R_costs"] = fee_R + (funding_R if isinstance(funding_R, (pd.Series, np.ndarray)) else float(funding_R))
+    trades["R"] = trades["R_gross"] - trades["R_costs"]
+
+    # Export with schema
+    trades_export = normalize_events_schema(trades)
+    trades_export.to_csv(tpath, index=False)
+
+    cands_export = normalize_cands_schema(cands_t_norm)
+    cands_export.to_csv(trpath, index=False)
 
     wins_fp_cols = ["ts", "side", "rule_id"] + [c for c in RULE_FINGERPRINT_FEATURES if c in ev.columns]
     ev.loc[ev["outcome"] == "win", wins_fp_cols].to_csv(fold_dir / "wins_fingerprints.csv", index=False)
@@ -1281,6 +1622,7 @@ def stage_simulate(
             "wins_all_events": wins_all,
             "losses_all_events": losses_all,
             "timeouts_all_events": timeouts_all,
+            "preempted_events": preempted_total,
             "win_rate": wr_all,
             "expected_R_per_event": expR_all,
             "r_mult": label_r_mult,
@@ -1296,51 +1638,49 @@ def stage_simulate(
         f"wins={wins_all}, losses={losses_all}, timeouts={timeouts_all}"
     )
 
+    # Cost-aware summary (does not change existing outputs)
+    avg_cost_R = float(np.nanmean(trades["R_costs"])) if len(trades) else 0.0
+    _log(
+        f"[{sym}] simulate[costs]: avg_cost_R={avg_cost_R:.4f} maker={maker:.4f} taker={taker:.4f} "
+        f"fund/hr={fund_per_hour:.5f} fund_on={fund_enabled}"
+    )
+
     ev_g = ev[ev["enter"]].copy()
     gated_count = int(ev_g.shape[0])
 
-    # ---- progress + scheduler cfg ----
-    prog_cfg = (cfg.get("progress", {}) or {}).get("sim", {}) or {}
-    show_inner = bool(prog_cfg.get("inner_schedule_bar", False))
-    desc_inner = str(prog_cfg.get("schedule_desc", "schedule"))
-    upd_every = int(prog_cfg.get("schedule_update_every", 1000))
+    ev_g_export = normalize_events_schema(ev_g)
+    ev_g_export.to_csv(fold_dir / "trades_gated_presched.csv", index=False)
 
-    sched_cfg = (cfg.get("execution_sim", {}) or {}).get("scheduler", {}) or {}
-    weight_mode = str(sched_cfg.get("weight_mode", "expR"))
-    sched_r_mult = float(sched_cfg.get("r_mult", 5.0))
-    timeout_sec = sched_cfg.get("timeout_sec", None)
-    timeout_sec = float(timeout_sec) if timeout_sec is not None else None
-
-    # pre-schedule snapshot to guarantee downstream artifacts exist
-    ev_g.to_csv(fold_dir / "trades_gated_presched.csv", index=False)
-
-    if fold_idx is not None and len(test_months):
-        progress_label = f"{desc_inner} [{sym}|Fold {fold_idx}|test={test_months[0]}]"
-    elif fold_idx is not None:
-        progress_label = f"{desc_inner} [{sym}|Fold {fold_idx}]"
-    elif len(test_months):
-        progress_label = f"{desc_inner} [{sym}|test={test_months[0]}]"
-    else:
-        progress_label = f"{desc_inner} [{sym}]"
-
+    # Sequential scheduling: one-at-a-time, busy until exit
+    selected = ev_g.sort_values(["ts", "side"]).reset_index(drop=True)
+    position_open = False
+    position_exit_ts = -1
+    kept_rows = []
+    preempted_count = 0
+    for _, r in selected.iterrows():
+        t = int(r.get("ts", 0))
+        if position_open and t < position_exit_ts:
+            preempted_count += 1
+            continue
+        kept_rows.append(r)
+        out_ts_val = r.get("outcome_ts")
+        out_ts = None
+        try:
+            if pd.notna(out_ts_val):
+                out_ts = int(out_ts_val)
+        except Exception:
+            pass
+        if out_ts is None:
+            out_ts = t + int(float(labels_cfg_sim.get("horizon_hours", 480)) * 3600_000)
+        position_open = True
+        position_exit_ts = int(out_ts)
+    take_sched = pd.DataFrame(kept_rows).reset_index(drop=True) if kept_rows else selected.iloc[0:0].copy()
+    # Persist for parity tooling
     try:
-        take_sched = schedule_non_overlapping(
-            ev_g,
-            weight_mode=weight_mode,
-            r_mult=sched_r_mult,
-            show_progress=show_inner,
-            progress_desc=progress_label,
-            update_every=upd_every,
-            timeout_sec=timeout_sec,
-        )
-        scheduler_fallback = False
-    except Exception as _e:
-        _log(f"[{sym}] schedule_non_overlapping fallback: {_e}")
-        take_sched = ev_g.copy()
-        scheduler_fallback = True
-
-    # canonical scheduled trades
-    take_sched.to_csv(fold_dir / "trades_gated.csv", index=False)
+        normalize_events_schema(take_sched).to_parquet(fold_dir / "sim_scheduled.parquet", index=False)
+    except Exception:
+        pass
+    print(f"[SIM] admin_preempt(position_open)={preempted_count}")
 
     tw = (cfg.get("tripwires", {}) or {})
     ppv_lcb_min = float(tw.get("ppv_lcb_min", 0.50))
@@ -1419,11 +1759,14 @@ def stage_simulate(
         "scheduler_fallback_used": bool(scheduler_fallback),
     }
 
-    with open(fold_dir / "tripwire_status.json", "w") as fh:
+    with open(fold_dir / "tripwire_status.json", "w", encoding="utf-8") as fh:
         json.dump(tripwire, fh, indent=2)
 
     if ppv_breach_days or to_breach_days:
         _log(f"[{sym}] TRIPWIRE breach: {tripwire}")
+
+    take_sched_export = normalize_events_schema(take_sched)
+    take_sched_export.to_csv(fold_dir / "trades_gated.csv", index=False)
 
     _log(f"[SIM] coverage={coverage:.3f} selected={gated_count} scheduled={len(take_sched)}")
 
@@ -1469,6 +1812,54 @@ def stage_simulate(
         + (" [fallback]" if scheduler_fallback else "")
     )
 
+    # --- Parity tests (hard-fail if references provided) ---
+    parity = (cfg.get("tests", {}) or {}).get("parity", {}) or {}
+    if bool(parity.get("enabled", False)):
+        import json as _json
+        import numpy as _np
+        import pandas as _pd
+        import sys as _sys
+        r_tol = float(parity.get("r_tol", 0.02))
+        max_sig_mm = int(parity.get("max_signal_mismatch", 0))
+        sig_ref = parity.get("signals_ref_csv")
+        trd_ref = parity.get("trades_ref_csv")
+
+        # SAME-SIGNAL: compare enter mask if reference exists
+        sig_fail = 0
+        if sig_ref:
+            ref = _pd.read_csv(sig_ref)
+            cur = ev[["ts", "side", "enter"]].copy()
+            joined = _pd.merge(cur, ref, on=["ts", "side"], how="outer", suffixes=("_cur", "_ref"))
+            joined["enter_cur"] = joined["enter_cur"].fillna(False).astype(bool)
+            joined["enter_ref"] = joined["enter_ref"].fillna(False).astype(bool)
+            mism = (joined["enter_cur"] != joined["enter_ref"]).sum()
+            sig_fail = int(mism)
+            _log(f"[{sym}] parity[same-signal]: mismatches={mism}")
+            if sig_fail > max_sig_mm:
+                _log(f"[{sym}] parity[same-signal]=FAIL (>{max_sig_mm})")
+                _sys.exit(1)
+            else:
+                _log(f"[{sym}] parity[same-signal]=PASS")
+
+        # SAME-TRADE: compare exit_type and R_net if reference exists
+        if trd_ref:
+            ref = _pd.read_csv(trd_ref)
+            cur = trades_export[["ts", "side", "outcome", "R"]].copy()
+            cur = cur.rename(columns={"outcome": "exit_type", "R": "R_net"})
+            ref = ref[["ts", "side", "exit_type", "R_net"]].copy()
+            j = _pd.merge(cur, ref, on=["ts", "side"], how="outer", suffixes=("_cur", "_ref"))
+            j["exit_type_cur"] = j["exit_type_cur"].fillna("MISSING")
+            j["exit_type_ref"] = j["exit_type_ref"].fillna("MISSING")
+            type_mismatch = (j["exit_type_cur"] != j["exit_type_ref"]).sum()
+            r_diff = (j["R_net_cur"].fillna(_np.nan) - j["R_net_ref"].fillna(_np.nan)).abs()
+            r_mismatch = int((r_diff > r_tol).sum())
+            _log(f"[{sym}] parity[same-trade]: exit_type_mismatch={type_mismatch} R_mismatch(>{r_tol})={r_mismatch}")
+            if type_mismatch > 0 or r_mismatch > 0:
+                _log(f"[{sym}] parity[same-trade]=FAIL")
+                _sys.exit(1)
+            else:
+                _log(f"[{sym}] parity[same-trade]=PASS")
+
 
 # ------------------------ orchestrator ------------------------
 
@@ -1476,8 +1867,12 @@ def stage_simulate(
 def run_walkforward(cfg_path: str, force: bool, clean: bool, only: Optional[str], from_stage: Optional[str], until_stage: Optional[str]) -> None:
 
 
+    cfg_path = Path(cfg_path)
+
     cfg = load_cfg(cfg_path)
 
+
+    ensure_parquet_engine()
 
     out_root = Path(cfg.get("io", {}).get("outputs_root", "outputs"))
 
@@ -1559,7 +1954,7 @@ def run_walkforward(cfg_path: str, force: bool, clean: bool, only: Optional[str]
                 try:
 
 
-                    stage_features(sym, tr_m, te_m, cfg, fold_dir, force)
+                    stage_features(sym, tr_m, te_m, cfg, cfg_path, fold_dir, force)
 
 
                 except Exception as e:
@@ -1580,7 +1975,7 @@ def run_walkforward(cfg_path: str, force: bool, clean: bool, only: Optional[str]
                 try:
 
 
-                    stage_tick_labeling(sym, tr_m, te_m, cfg, fold_dir, force)
+                    stage_tick_labeling(sym, tr_m, te_m, cfg, cfg_path, fold_dir, force)
 
 
                 except Exception as e:
@@ -1601,7 +1996,7 @@ def run_walkforward(cfg_path: str, force: bool, clean: bool, only: Optional[str]
                 try:
 
 
-                    stage_mining(sym, tr_m, te_m, cfg, fold_dir, force)
+                    stage_mining(sym, tr_m, te_m, cfg, cfg_path, fold_dir, force)
 
 
                 except Exception as e:
@@ -1622,7 +2017,7 @@ def run_walkforward(cfg_path: str, force: bool, clean: bool, only: Optional[str]
                 try:
 
 
-                    stage_simulate(sym, tr_m, te_m, cfg, fold_dir, force, fold_idx=i)
+                    stage_simulate(sym, tr_m, te_m, cfg, cfg_path, fold_dir, force)
 
 
                 except Exception as e:
@@ -1643,6 +2038,8 @@ def run_walkforward(cfg_path: str, force: bool, clean: bool, only: Optional[str]
 def main():
 
 
+    _seed_determinism()
+
     args = parse_args()
 
 
@@ -1651,6 +2048,8 @@ def main():
 
         cfg = load_cfg(args.config)
 
+
+        ensure_parquet_engine()
 
         _log("Preflight OK")
 

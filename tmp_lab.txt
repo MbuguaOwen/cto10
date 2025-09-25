@@ -1,0 +1,27 @@
+﻿    max_signal_mismatch: 0
+io:
+  outputs_root: outputs
+  progress: true
+
+data:
+  symbols: [BTCUSDT]
+  bars_dir: inputs/bars_1m
+  ticks_dir: inputs/ticks
+  bar_schema: auto
+  file_patterns:
+    bars: "{SYMBOL}/{SYMBOL}-1m-{YYYY}-{MM}.csv"
+    ticks: "{SYMBOL}/{SYMBOL}-ticks-{YYYY}-{MM}.csv"
+  months: { start: "2025-01", end: "2025-08" }
+
+walkforward:
+  train_months: 3
+  test_months: 1
+  step_months: 1
+  progress: true
+
+features:
+  atr_n: 14
+  donch_n_candidate: 20
+  percentiles_fit_on: train
+
+  # Base features (semicolon-separated per line, as expected by bars.py)

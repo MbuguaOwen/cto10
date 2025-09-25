@@ -1,160 +1,294 @@
-cto10r — Clean Take-Off 10R (Bars for features, Ticks for labels)
+cto10r — Robust, parity-faithful research pipeline (Quick Ignition on, Vol Gate off)
 
-A deterministic research pipeline to discover and evaluate 10R Clean Take-Off (10R-CTO) fingerprints:
+This repo runs a walkforward research pipeline for pattern discovery and ML gating on crypto ticks/bars.
+The current configuration mirrors the “quick ignition” live policy:
 
-Bars (1-minute by default) → build multi-horizon features and gate candidates.
+Non-overlap: enabled
 
-Ticks → provide first-touch truth for SL/TP labeling (no OHLC ambiguity).
+Policy: quick (one ticket per side per symbol within a short “quick window”; defaults to 6h)
 
-Targets (research): hit +1R inside “quick ignition”, and +10R within horizon.
+Volatility prefilter: disabled (no atr_p cutoff)
 
-Entry level: entry-minus-cushion (P = E − η·ATR(t) for longs; mirrored for shorts).
+Labeling: strict first-touch on ticks (causal), with clean separation of administrative vs real timeouts
 
-Volatility-aware “R-hero”: SL distance η can adapt to ATR percentile; label time windows can scale with η so +1R/+10R remain feasible in high vol.
+Simulation: fees + (optional) funding applied; no inventory overlaps needed because quick policy blocks stacking
 
-CLI
-python -m cto10r --config configs/motifs.yaml --mode preflight|walkforward [--force] [--clean]
-# Stage controls (added): --only {features|tick_labeling|mining|simulate} | --from <stage> | --until <stage>
+1) What’s in here
 
-Stages (and what they write)
+cto10r/ – pipeline code:
 
-preflight → fail-fast config & data checks
+walkforward.py – stages: features → tick_labeling → mining → simulate
 
-features → loads bars, builds features, fits percentiles on train, writes:
+ticks.py – tick-window labeling (first-touch TP/SL/timeout, no peeking)
 
-candidates.parquet (now includes per-row eta and risk_dist = eta * ATR)
+bars.py, candidates.py – features & candidate generation (CUSUM thinning)
 
-regimes.csv
+mining.py – rule mining with Wilson LCB & optional FDR
 
-tick labeling (ticks = first-touch, +1R quick ignition, +10R horizon, stop-band & dwell rules) → writes:
+gate.py, ml.py – ML gating, calibration, coverage/LCB targeting
 
-events.parquet with outcome ∈ {win,loss,timeout} and timestamps
+util.py – schema & helpers
 
-mining (simple interpretable rule miner) → writes:
+configs/
 
-artifacts/gating.json (+ placeholders for motif banks, if used)
+motifs.yaml – main configuration (see highlights below)
 
-simulate (test-month events only) → writes:
+inputs/ (you create)
 
-trades.csv, stats.json (wr, counts, expR proxy)
+bars_1m/{SYMBOL}/{SYMBOL}-1m-{YYYY}-{MM}.csv
 
-Each stage is resumable: re-runs SKIP (exists) unless --force. On exceptions, a crash_report.json is written with traceback + config snapshot.
+ticks/{SYMBOL}/{SYMBOL}-ticks-{YYYY}-{MM}.csv
 
-What’s new: Volatility-aware R/SL (“R-hero”)
+outputs/ – per-symbol, per-fold artifacts (features, candidates.parquet, events.parquet, mining & sim results)
 
-Per-row η from ATR percentile
-Configure a piecewise table: labels.eta_by_atr_p: [[lo,hi,eta], ...].
-The engine maps atr_p → eta and stores it per candidate (cands.eta).
+2) Requirements & installation
 
-Optional η caps
-labels.eta_cap.{min,max} clamps η to avoid absurd SLs or microscopic sizes downstream.
+Python 3.10–3.11 recommended
 
-Time scaling (optional)
-labels.time_scale_from_eta scales label windows with η (vs base_eta), with a clamp to avoid exploding/vanishing windows. This reduces artificial timeouts in high vol.
+pip install -r requirements.txt (pandas, numpy, scikit-learn, pyarrow/fastparquet, tqdm, etc.)
 
-TP stays in R-space
-Research uses labels.r_mult (default 10R). Changing η only changes distance, not $ risk if you size positions by R in live.
+Windows PowerShell note: use $env:VAR=value to set env vars temporarily in a shell.
 
-Typical workflow (step-by-step)
+3) Data layout
+inputs/
+  bars_1m/
+    BTCUSDT/BTCUSDT-1m-2025-04.csv
+  ticks/
+    BTCUSDT/BTCUSDT-ticks-2025-04.csv
 
-Since you just enabled the R-hero logic, the next command is tick labeling after rebuilding candidates.
 
-# 0) Preflight (sanity)
-python -m cto10r --config configs/motifs.yaml --mode preflight
+configs/motifs.yaml controls symbol list and month range.
 
-# 1) Rebuild candidates (now include per-row eta)
+4) Config highlights (current defaults)
+candidates:
+  mode: blind
+  blind:
+    thinning:
+      type: cusum_by_ret
+      params:
+        ret_lookback: 360
+        k_sigma: 1.6
+        drift: 0.0
+        min_gap_bars: 0          # no candidate-level collapse
+        fallback_stride_k: 0
+    sides: both
+  vol_prefilter: null            # ✅ VOL GATE OFF (no atr_p filter)
+
+labels:
+  r_mult: 5
+  horizon_hours: 480
+  non_overlap: true
+  non_overlap_policy: quick      # ✅ QUICK IGNITION (busy for quick window)
+  quick_ignition_hours: 6
+  intra_bar_epsilon_ms: 1
+  min_risk_atr_frac: 0.001
+  eta_atr: 15.0
+  eta_by_atr_p:                  # ✅ sane η (TP reachable)
+    - [0, 35, 0.50]
+    - [35, 65, 1.00]
+    - [65, 85, 2.00]
+    - [85, 95, 4.00]
+    - [95, 101, 6.00]
+  eta_cap: { min: 0.50, max: 6.00 }
+  time_scale_from_eta: { base_eta: 0.30, clamp: [0.75, 10.0] }
+  stop_band_atr: 0.05
+  no_ticks_policy: skip          # data gaps = administrative (excluded from learning)
+
+mining.rules:
+  auto_binning: true
+  n_bins_cont: 5
+  max_terms: 2
+  top_k: 60
+  min_support_frac: 0.001
+  min_months: 2
+  min_wins: 2
+  wilson_z: 1.96
+  fdr: { enabled: true, alpha: 0.10 }
+
+execution_sim:
+  fees:
+    maker_bps: 1.0
+    taker_bps: 5.0
+    entry_is_maker: false
+    exit_is_maker: true
+  funding:
+    enabled: true
+    rate_per_hour: 0.0001
+    sign: 1.0
+  inventory:
+    enable: false               # stacking prevented by quick window
+
+
+Why this shape?
+
+Quick ignition reproduces your previously better win/loss balance and avoids stacked signals from one impulse.
+
+Vol filter is removed to avoid upstream bias; instead, we dedupe one-per-side per quick window at the candidate stage (below).
+
+5) Pipeline stages
+A) Features
+
+Causal features (trend/ATR/Donchian/nonlinear, plus age features). Percentiles fit on train only.
+
 python -m cto10r --config configs/motifs.yaml --mode walkforward --only features --force
 
-# 2) Label with ticks (uses per-row time windows if enabled)
+B) Candidate generation & quick-window dedupe
+
+CUSUM triggers create raw candidates.
+
+Before labeling, we dedupe to one candidate per side per quick window (e.g., 6h). This dramatically reduces downstream administrative preemption while exactly matching the quick policy.
+
+You’ll see logs like:
+
+[SYMBOL] dedupe[quick=6h]: kept X/Y (Z%)
+
+C) Tick labeling (first-touch)
+
+For each candidate, build a tick window [t_entry+ε, deadline] and resolve:
+
+Long: TP if price ≥ target first; SL if price ≤ stop first
+
+Short: TP if price ≤ target first; SL if price ≥ stop first
+
+Timeout: neither hit by deadline
+
+Administrative: no_ticks_policy: skip marks such rows as preempted=True (excluded from learning)
+
+Diagnostics:
+
+[ticks] sanity: geom_bad=… tp_any=… sl_any=… first_touch_wins=… first_touch_losses=… timeouts=…
+[SYMBOL] events: N (wins=W, losses=L, timeouts=T)
+[SYMBOL] events detail: preempted=P, timeouts_nonpreempt=T-P
+
+
+Run:
+
 python -m cto10r --config configs/motifs.yaml --mode walkforward --only tick_labeling --force
 
-# 3) Mine rules (unchanged)
+
+Debug speed knob: limit labeling via env var:
+
+PowerShell: $env:LABEL_MAX=5000
+
+Bash: LABEL_MAX=5000
+Then run tick_labeling to test logic quickly.
+
+D) Mining
+
+Bins literals, computes Wilson lower confidence bounds, applies optional FDR.
+
+Promotes top rules and identifies loser masks.
+
 python -m cto10r --config configs/motifs.yaml --mode walkforward --only mining --force
 
-# 4) Simulate (unchanged; TP still = r_mult × SL)
+E) Simulation
+
+Gating (ML/LCB) → scheduled trades.
+
+Quick ignition policy is respected because we dedup upstream; no stacking occurs.
+
+Fees & funding applied.
+
 python -m cto10r --config configs/motifs.yaml --mode walkforward --only simulate --force
 
-# Full run from scratch (if needed)
-python -m cto10r --config configs/motifs.yaml --mode walkforward --clean --force
+6) Live-parity modes (how to switch later)
 
-Config essentials (excerpt)
-labels:
-  # Baseline eta (used if no table match) and baseline for time-scaling
-  eta_atr: 1.0
+Quick ignition (current): non_overlap: true, non_overlap_policy: quick, quick_ignition_hours: 6, plus candidate quick-window dedupe.
 
-  # ATR percentile → eta (volatility-aware SL)
-  eta_by_atr_p:
-    - [0,   35, 0.50]
-    - [35,  65, 1.00]
-    - [65,  85, 3.00]
-    - [85,  95, 7.50]
-    - [95, 101, 12.00]   # cap high-vol
+Busy until exit: non_overlap_policy: to_exit (block new entries until the previous trade exits). Remove/adjust candidate dedupe (it’s longer than quick).
 
-  # Optional hard caps (extra safety)
-  eta_cap:
-    min: 0.50
-    max: 12.00
+Allow overlaps: non_overlap: false, non_overlap_policy: none + inventory caps in sim. (Not used now.)
 
-  # Research targets in R-space
-  r_mult: 10.0
+Consistency across config + code is required to pass Same-signal / Same-trade tests.
 
-  # Optional: scale label windows with eta
-  time_scale_from_eta:
-    base_eta: 1.0       # compare η against this
-    clamp: [0.5, 40.0]  # keep windows reasonable
+7) Troubleshooting & red flags
 
-  # Invariants to respect:
-  # risk_floor_rho <= min(eta)  (otherwise candidates get zeroed)
+“Wins=0, losses huge” during labeling
+
+Likely TP unreachable: revert to sane η (see config above) and verify first-touch logic.
+
+Check tp_any in the sanity line; if near zero → TP too far or geometry wrong.
+
+Lots of timeouts
+
+If timeouts_nonpreempt is high, consider slightly longer horizon_hours (e.g., 600) or adjust r_mult.
+
+If preempted is high and no_ticks_windows>0 → data gaps; no_ticks_policy: skip is correct (excluded).
+
+ValueError: invalid literal for int() with base 10: 'auto'
+
+Ensure any n_bins_cont: auto is only used where the code supports it; otherwise set a concrete int (e.g., 5).
+
+FileNotFoundError: candidates.parquet
+
+Run stages in order; features must precede tick_labeling; candidates are created in features stage.
+
+Too few promotions (promoted=0)
+
+You may simply be sample-starved after strict filtering. Increase train months or relax rule thresholds. (Optional small-sample fallback can be added if desired.)
+
+8) Performance tips
+
+Quick-window dedupe upstream reduces candidate count dramatically → faster labeling + cleaner training.
+
+Use LABEL_MAX while iterating on labeler logic.
+
+Keep walkforward.progress: true to monitor long runs.
+
+9) Metrics & definitions
+
+PPV: wins / (wins + losses) among resolved (timeouts excluded).
+
+LCB: Wilson lower confidence bound at wilson_z (default 1.96 ≈ 95%).
+
+Coverage: fraction of candidates selected by the gate (or scheduled) over total candidates.
+
+10) Typical run
+# Clean start after config/code changes
+python -m cto10r --config configs/motifs.yaml --mode walkforward --clean --force --only features
+
+# Label
+python -m cto10r --config configs/motifs.yaml --mode walkforward --only tick_labeling --force
+
+# Mine & simulate
+python -m cto10r --config configs/motifs.yaml --mode walkforward --only mining --force
+python -m cto10r --config configs/motifs.yaml --mode walkforward --only simulate --force
 
 
-If you want your prior η = 15 world as baseline, set eta_atr: 15.0, raise the top bin/cap (e.g., 20–30), and set time_scale_from_eta.base_eta: 15.0.
+Expected logs (per fold):
 
-Data requirements
+Candidate quick dedupe line
 
-Bars: CSV/Parquet with ts (ms), open, high, low, close. Monotonic ts per symbol.
+Tick sanity line
 
-Ticks: CSV/Parquet with ts (ms), price. The engine streams monthly files and filters by candidate windows.
+Events summary with non-zero wins
 
-Mixed epoch units (s/ms/µs/ns) are auto-coerced; rows with non-finite ts are skipped.
+Mining promotions summary
 
-Quick sanity checks
+Simulate coverage/PPV/LCB
 
-After features: outputs/<SYM>/fold_i/candidates.parquet has eta, risk_dist, and non-zero rows.
+11) Contributing / extending
 
-After tick_labeling: console prints events: N (wins=…, losses=…, timeouts=…) per fold and writes events.parquet.
+Add curated motifs (whitelists) by introducing a curated_motifs: block in the YAML and wiring them into mining.py if you want hand-picked literals.
 
-After simulate: stats.json shows non-zero totals; trades.csv exists.
+To compare parity modes, keep separate YAMLs (e.g., motifs_quick.yaml, motifs_to_exit.yaml) and re-run walkforward.
 
-Troubleshooting
+12) License
 
-Zero candidates: relax gates in this order → close_to_ext_atr_max ↑, t240_abs_min ↓, accel_15_240_min ↓, reduce kappa quorum. Ensure risk_floor_rho ≤ min(eta).
+Choose an appropriate license for your project (e.g., MIT/Apache-2.0) and place it in LICENSE.
 
-All timeouts in high vol: enable time scaling (time_scale_from_eta) or increase horizon_hours / quick_ignition_hours.
+Final checklist before you run
 
-Tick crashes on timestamps: CSV row with bad ts is skipped; Parquet path coerces units. If a month still shows zero ticks, confirm files and month ranges.
+ vol_prefilter is null (or removed)
 
-Leakage sanity checks
+ non_overlap_policy: quick and quick_ignition_hours: 6
 
-python leakage_helpers.py permute --fold 0
-  Shuffles train labels for fold 0 (writes events_train.perm_bak.csv backup). Re-run mining+simulate for that fold; gated PPV should crash to baseline.
+ Quick-window dedupe is active in stage_tick_labeling
 
-python leakage_helpers.py shift --fold 0 --steps 1
-  Time-shifts train labels forward by one row (backup: events_train.shift_bak.csv). Re-mine and simulate; PPV should again fall to baseline.
+ Labeler uses first-touch (TP/SL) with t_entry + ε start
 
-python leakage_helpers.py simulate-twice --config configs/motifs_f0.yaml
-  Runs walkforward simulate twice back-to-back with the same config. Scheduled counts/outcomes should match exactly between runs.
+ eta_by_atr_p is 0.5–6.0 band
 
-python leakage_helpers.py bh --folds 0 1 --alpha 0.10
-  Quick Benjamini–Hochberg filter using 1 - precision_lcb as a faux p-value.
+ no_ticks_policy: skip
 
-Determinism & deps
-
-Seed: seed: 42 (set in YAML).
-
-Python 3.10+, libs: numpy, pandas, pyyaml, tqdm (plus your Parquet engine: pyarrow or fastparquet).
-
-Notes
-
-The built-in miner is intentionally simple (coarse bins, short rules) for transparency. Feel free to swap a more powerful miner later.
-
-Learning excludes TSL by design; use TSL (or BE/partials) only in live after +1R if you want to reduce tail risk time in market.
+ Fees/funding set to match your venue

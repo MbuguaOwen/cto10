@@ -1,0 +1,201 @@
+﻿    # Friendly guard: require features stage to exist
+    cpath = fold_dir / "candidates.parquet"
+    if not cpath.exists():
+        raise FileNotFoundError(
+            f"{cpath} not found. Run features stage first:\n"
+            f"  python -m cto10r --config {cfg_path} --mode walkforward --only features --force"
+        )
+    cands = pd.read_parquet(cpath)
+
+    # High-volatility prefilter (causal)
+    vol_cfg = (cfg.get("candidates", {}) or {}).get("vol_prefilter", {}) or {}
+    _minp = vol_cfg.get("min_percentile", None)
+    _col = vol_cfg.get("column", "atr_p")
+    if _minp is not None and _col in cands.columns:
+        _before = len(cands)
+        cands = cands[cands[_col] >= int(_minp)].copy()
+        _log(f"[{sym}] prefilter[{_col}>={_minp}]: kept {len(cands)}/{_before} ({len(cands)/max(1,_before):.1%})")
+
+
+    if cands.empty:
+
+
+        empty_events = pd.DataFrame(columns=["ts", "side", "entry", "level", "risk_dist", "outcome"])
+        empty_events = normalize_events_schema(empty_events)
+        empty_events.attrs["no_ticks_windows"] = 0
+        empty_events.to_parquet(epath, index=False)
+
+
+        _log(f"[{sym}] events: 0 (no candidates)")
+
+
+        _write_fingerprint(
+            artifacts_dir,
+            "tick_labeling",
+            cfg_path,
+            {
+                "train_months": list(train_months),
+                "test_months": list(test_months),
+                "events": 0,
+                "wins": 0,
+                "losses": 0,
+                "timeouts": 0,
+                "preempted": 0,
+                "no_ticks_windows": 0,
+                "tick_files": tick_file_info,
+            },
+        )
+
+
+        return
+
+
+    cands = cands.sort_values("ts").reset_index(drop=True)
+
+
+    _log(f"[{sym}] tick_labeling: candidates={len(cands)}")
+
+    tick_file_info: List[Dict[str, Any]] = []
+    months_all = list(dict.fromkeys(train_months + test_months))
+
+
+    try:
+
+
+        bar_seconds = infer_bar_seconds(cands["ts"])
+
+
+    except Exception:
+
+
+        bar_seconds = 60
+
+
+    labels_cfg = cfg["labels"]
+
+
+    H_hours = int(labels_cfg.get("horizon_hours", 72))
+
+
+    Q_hours = int(labels_cfg.get("quick_ignition_hours", 2))
+
+
+    non_overlap = bool(labels_cfg.get("non_overlap", True))
+
+
+    stop_band_atr = float(labels_cfg.get("stop_band_atr", 0.0))
+
+
+    consec = int(labels_cfg.get("consec_ticks", labels_cfg.get("violation_consecutive_ticks", 1)))
+
+
+    dwell_ms = int(labels_cfg.get("dwell_ms", labels_cfg.get("violation_dwell_ms", 0)))
+
+
+    r_mult = float(labels_cfg.get("r_mult", 10.0))
+    # Policy and epsilon for tick labeling
+    non_overlap_policy = str(labels_cfg.get("non_overlap_policy", "quick"))
+    intra_eps_ms = int(labels_cfg.get("intra_bar_epsilon_ms", 1))
+    min_risk_atr_frac = float(labels_cfg.get("min_risk_atr_frac", 0.001))
+    no_ticks_policy = str(labels_cfg.get("no_ticks_policy", "timeout"))
+
+
+    ts_cfg = labels_cfg.get("time_scale_from_eta")
+
+
+    base_eta = None
+
+
+    clamp = None
+
+
+    if ts_cfg:
+
+
+        base_eta = float(ts_cfg.get("base_eta", labels_cfg.get("eta_atr", 0.30)))
+
+
+        clamp_vals = ts_cfg.get("clamp", [0.5, 20.0])
+
+
+        clamp = (float(clamp_vals[0]), float(clamp_vals[1]))
+
+
+    H_ms_base = int(H_hours * 3600 * 1000)
+
+
+    if ts_cfg and clamp and "eta" in cands.columns:
+
+
+        base = float(base_eta or labels_cfg.get("eta_atr", 0.30)) or 1.0
+
+
+        scale = (cands["eta"].astype(float) / base).clip(clamp[0], clamp[1])
+
+
+        H_ms_i = (H_ms_base * scale).astype("int64")
+
+
+        tmin = int(cands["ts"].min())
+
+
+        tmax = int((cands["ts"] + H_ms_i).max())
+
+
+    else:
+
+
+        tmin = int(cands["ts"].min())
+
+
+        tmax = int(cands["ts"].max() + H_ms_base)
+
+
+    ticks_dir = Path(cfg["data"]["ticks_dir"])
+
+
+    patt = cfg["data"]["file_patterns"]["ticks"]
+
+
+    tick_files = list(iter_ticks_files(ticks_dir, sym, months_all, patt))
+    tick_file_info = []
+    for ym, path_obj in tick_files:
+        entry = {"ym": ym, "path": str(path_obj)}
+        try:
+            stat = Path(path_obj).stat()
+            entry.update({"size": stat.st_size, "mtime": stat.st_mtime, "sha256": _sha256_path(Path(path_obj))})
+        except Exception:
+            pass
+        tick_file_info.append(entry)
+    print(f"[ticks] files: {len(tick_files)} files for {sym} {test_months}")
+
+    progress_on = bool(cfg.get("io", {}).get("progress", True))
+
+
+    if not tick_files:
+
+
+        ev = cands.copy()
+
+
+        ev["outcome"] = "timeout"
+
+
+        ev["outcome_ts"] = ev["ts"]
+
+
+        ev["r1_ts"] = np.nan
+
+
+        ev["tp_ts"] = np.nan
+
+
+        ev = normalize_events_schema(ev)
+        ev.attrs["no_ticks_windows"] = len(ev)
+        ev.to_parquet(epath, index=False)
+
+
+        _log(f"[{sym}] events: {len(ev)} (wins=0, losses=0, timeouts={len(ev)})")
+
+
+        _write_fingerprint(

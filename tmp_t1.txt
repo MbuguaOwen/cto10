@@ -1,0 +1,81 @@
+﻿        df = pd.DataFrame(results)
+        df.attrs["no_ticks_windows"] = no_ticks_windows
+        if "preempted" not in df.columns:
+            df["preempted"] = False
+        df["preempted"] = df["preempted"].fillna(False).astype(bool)
+        print(f"[ticks] diagnostics: no_ticks_windows={no_ticks_windows}")
+        return df
+
+    ticks = pd.concat(all_ticks, axis=0).sort_values("ts").reset_index(drop=True)
+    tss_all = pd.to_numeric(ticks["ts"], errors="coerce").astype("int64").to_numpy()
+    px_all = pd.to_numeric(ticks["price"], errors="coerce").astype(float).to_numpy()
+
+    busy_until = -1
+    for i, row in _with_progress(cands.iterrows()):
+        ts_entry = int(row["ts"])
+        side, entry, level, risk, atr_val = _resolve_params(row)
+        # Risk fallback with ATR-based floor (count diagnostics)
+        R = _safe_float(row.get("risk_dist"), default=np.nan)
+        if not np.isfinite(R) or R <= 0:
+            atr = _safe_float(row.get("atr"), default=np.nan)
+            eta = _safe_float(row.get("eta"), default=np.nan)
+            if np.isfinite(atr) and atr > 0 and np.isfinite(eta) and eta > 0:
+                R = eta * atr
+            elif np.isfinite(atr) and atr > 0:
+                R = atr
+            else:
+                R = _safe_float(abs(_safe_float(row.get("entry")) - _safe_float(row.get("level"))), default=np.nan)
+            fallback_risk_count += 1
+        # enforce ATR-based floor if ATR present
+        atr_for_floor = _safe_float(row.get("atr"), default=np.nan)
+        if np.isfinite(atr_for_floor) and atr_for_floor > 0:
+            R = max(R, float(min_risk_frac) * atr_for_floor)
+        if not np.isfinite(R) or R <= 0:
+            R = 1e-6
+        risk = float(R)
+        atr_use = atr_val if np.isfinite(atr_val) else 0.0
+
+        if non_overlap and busy_until != -1 and ts_entry < busy_until:
+            results.append({
+                "ts": ts_entry,
+                "side": side,
+                "entry": entry,
+                "level": level,
+                "risk_dist": risk,
+                "outcome": "timeout",
+                "outcome_ts": ts_entry,
+                "r1_ts": None,
+                "tp_ts": None,
+                "preempted": True,
+            })
+            continue
+
+        tp = entry + r_mult * risk if side == "long" else entry - r_mult * risk
+        r1 = entry + 1.0 * risk if side == "long" else entry - 1.0 * risk
+
+        H_i = int(H_ms[i]) if i < len(H_ms) else H_ms_base
+        Q_i = int(Q_ms[i]) if i < len(Q_ms) else Q_ms_base
+        t_end = ts_entry + H_i
+        t_r1_deadline = ts_entry + Q_i
+
+        # Shift window start by +Îµ to forbid intra-bar peeking at entry tick
+        slice_start = int(ts_entry) + int(intra_eps_ms)
+        # find lo index strictly after entry
+        lo = np.searchsorted(tss_all, slice_start, side="left")
+        hi = np.searchsorted(tss_all, t_end, side="right")
+        if hi <= lo:
+            no_ticks_windows += 1
+            base_row = {
+                "ts": ts_entry,
+                "side": side,
+                "entry": entry,
+                "level": level,
+                "risk_dist": risk,
+                "r1_ts": None,
+                "tp_ts": None,
+            }
+            if str(no_ticks_policy).lower() == "skip":
+                results.append({
+                    **base_row,
+                    "outcome": "timeout",
+                    "outcome_ts": t_end,

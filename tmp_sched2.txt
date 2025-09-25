@@ -1,0 +1,141 @@
+﻿    fund_per_hour = float(fund_cfg.get("rate_per_hour", 0.0))  # e.g. 0.0001 for 1bp/hr
+    fund_sign = float(fund_cfg.get("sign", 1.0))  # +1 cost for longs by default; set -1 if your venue credits longs
+
+    # --- Convert costs to R-units using entry and risk distance ---
+    # R-unit = price move equal to risk_dist. Fee in R = (fee * entry_price) / risk_dist.
+    # This cancels quantity. We guard zeros/NaNs with eps.
+    eps = 1e-12
+    entry = pd.to_numeric(trades.get("entry"), errors="coerce")
+    risk  = pd.to_numeric(trades.get("risk_dist"), errors="coerce").abs()
+    leverage = (entry / np.maximum(risk, eps)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    fee_R = leverage * (fee_entry + fee_exit)
+
+    # --- Funding proration by time in position ---
+    if fund_enabled:
+        t_start = pd.to_numeric(trades.get("ts"), errors="coerce")
+        t_end   = pd.to_numeric(trades.get("outcome_ts"), errors="coerce")
+        hours   = ((t_end - t_start).astype(float) / 3600.0).clip(lower=0.0)
+        funding_R = leverage * fund_per_hour * hours * fund_sign
+    else:
+        funding_R = 0.0
+
+    trades["R_costs"] = fee_R + (funding_R if isinstance(funding_R, (pd.Series, np.ndarray)) else float(funding_R))
+    trades["R"] = trades["R_gross"] - trades["R_costs"]
+
+    # Export with schema
+    trades_export = normalize_events_schema(trades)
+    trades_export.to_csv(tpath, index=False)
+
+    cands_export = normalize_cands_schema(cands_t_norm)
+    cands_export.to_csv(trpath, index=False)
+
+    wins_fp_cols = ["ts", "side", "rule_id"] + [c for c in RULE_FINGERPRINT_FEATURES if c in ev.columns]
+    ev.loc[ev["outcome"] == "win", wins_fp_cols].to_csv(fold_dir / "wins_fingerprints.csv", index=False)
+
+    stats_existing: Dict[str, Any] = {}
+    if spath.exists():
+        try:
+            with spath.open("r", encoding="utf-8") as f:
+                stats_existing = json.load(f)
+        except Exception:
+            stats_existing = {}
+
+    stats_existing.update(
+        {
+            "total_events": total,
+            "wins_all_events": wins_all,
+            "losses_all_events": losses_all,
+            "timeouts_all_events": timeouts_all,
+            "preempted_events": preempted_total,
+            "win_rate": wr_all,
+            "expected_R_per_event": expR_all,
+            "r_mult": label_r_mult,
+            "gate_coverage": coverage,
+        }
+    )
+
+    stats_existing.update(decided_metrics)
+
+    dump_json(stats_existing, spath)
+    _log(
+        f"[{sym}] simulate: total={total}, wr={wr_all:.3f}, expR={expR_all:.2f}, "
+        f"wins={wins_all}, losses={losses_all}, timeouts={timeouts_all}"
+    )
+
+    # Cost-aware summary (does not change existing outputs)
+    avg_cost_R = float(np.nanmean(trades["R_costs"])) if len(trades) else 0.0
+    _log(
+        f"[{sym}] simulate[costs]: avg_cost_R={avg_cost_R:.4f} maker={maker:.4f} taker={taker:.4f} "
+        f"fund/hr={fund_per_hour:.5f} fund_on={fund_enabled}"
+    )
+
+    ev_g = ev[ev["enter"]].copy()
+    gated_count = int(ev_g.shape[0])
+
+    ev_g_export = normalize_events_schema(ev_g)
+    ev_g_export.to_csv(fold_dir / "trades_gated_presched.csv", index=False)
+
+    # Overlapping entries with inventory caps
+    inv_cfg = (cfg.get("execution_sim", {}) or {}).get("inventory", {}) or {}
+    inv_enable = bool(inv_cfg.get("enable", True))
+    max_side = int(inv_cfg.get("max_concurrent_per_side", 9999))
+    max_all = int(inv_cfg.get("overall_max_concurrent", 9999))
+    risk_cap = float(inv_cfg.get("risk_cap_r", float("inf")))
+
+    if inv_enable:
+        ev_g_sorted = ev_g.sort_values("ts").reset_index(drop=True)
+        active_by_side = {"long": 0, "short": 0}
+        active_total = 0
+        active_risk = 0.0
+        keep_idx = []
+        for idx, row in ev_g_sorted.iterrows():
+            side = str(row.get("side", ""))
+            r_units = float(row.get("risk_r", 1.0))
+            if active_by_side.get(side, 0) >= max_side:
+                continue
+            if active_total >= max_all:
+                continue
+            if (active_risk + r_units) > risk_cap:
+                continue
+            keep_idx.append(idx)
+            active_by_side[side] = active_by_side.get(side, 0) + 1
+            active_total += 1
+            active_risk += r_units
+        take_sched = ev_g_sorted.loc[keep_idx].copy()
+        scheduler_fallback = False
+    else:
+        # Default: keep all gated without spacing
+        take_sched = ev_g.copy()
+        scheduler_fallback = False
+
+    tw = (cfg.get("tripwires", {}) or {})
+    ppv_lcb_min = float(tw.get("ppv_lcb_min", 0.50))
+    timeout_rate_max = float(tw.get("timeout_rate_max", 0.60))
+    window_days = int(tw.get("window_days", 3))
+    fallback_days_max = int(tw.get("fallback_days_max", 3))
+
+    tg = take_sched.copy()
+    if "ts" in tg.columns:
+        tscol = "ts"
+        tg["_date"] = pd.to_datetime(tg[tscol], unit="s", errors="coerce").dt.date
+    else:
+        tg["_date"] = pd.NaT
+
+    is_win = tg.get("is_win")
+    is_loss = tg.get("is_loss")
+    is_to = tg.get("is_to")
+    if is_win is None or is_loss is None:
+        oc = tg.get("outcome")
+        if oc is not None:
+            oc = oc.fillna("")
+            is_win = (oc == "win").astype(int)
+            is_loss = (oc == "loss").astype(int)
+            if "timeout" in set(oc.unique()):
+                is_to = (oc == "timeout").astype(int)
+            else:
+                is_to = pd.Series([0] * len(tg), index=tg.index, dtype=int)
+        else:
+            zeros = pd.Series([0] * len(tg), index=tg.index, dtype=int)
+            is_win = zeros.copy()
+            is_loss = zeros.copy()

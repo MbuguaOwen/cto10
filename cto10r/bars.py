@@ -93,65 +93,47 @@ def load_bars_any(path: Path, schema: str = "auto") -> pd.DataFrame:
 
 
 
-    lc = {c.lower(): c for c in df.columns}
+    cols_map = {c.lower().strip(): c for c in df.columns}
 
-
-
-    # timestamp column -> 'ts' in milliseconds
-
-    ts_col = lc.get("ts") or lc.get("timestamp") or lc.get("open_time")
-
-    if ts_col is None:
-
-        raise ValueError(f"Bars file missing a timestamp/open_time column at {path}")
-
-
-
-    raw_ts = pd.to_numeric(df[ts_col], errors="coerce")
-
-    ts = coerce_epoch_ms(raw_ts)
-
-
-
-    out = pd.DataFrame({"ts": ts})
-
-
-
-    def pick(*alts):
-
-        for a in alts:
-
-            if a in lc:
-
-                return pd.to_numeric(df[lc[a]], errors="coerce")
-
+    def _pick(*cands):
+        for cand in cands:
+            key = cand.lower().strip()
+            if key in cols_map:
+                return cols_map[key]
         return None
 
+    ts_col = _pick("ts", "timestamp", "open_time", "time")
+    open_col = _pick("open", "o", "open_price")
+    high_col = _pick("high", "h", "high_price")
+    low_col = _pick("low", "l", "low_price")
+    close_col = _pick("close", "c", "close_price")
 
+    required = [ts_col, open_col, high_col, low_col, close_col]
+    if any(col is None for col in required):
+        raise ValueError(f"Bars file missing required columns ts/open/high/low/close (got: {list(df.columns)})")
 
-    o = pick("open","o"); h = pick("high","h"); l = pick("low","l"); c = pick("close","c")
+    df = df.rename(
+        columns={
+            ts_col: "ts",
+            open_col: "open",
+            high_col: "high",
+            low_col: "low",
+            close_col: "close",
+        }
+    )
 
-    if any(s is None for s in (o,h,l,c)):
+    df["ts"] = coerce_epoch_ms(df["ts"])
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        raise ValueError(f"Bars file missing OHLC columns at {path}")
+    df = df.dropna(subset=["ts", "open", "high", "low", "close"])
+    df["ts"] = df["ts"].astype("int64")
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype("float64")
 
+    out = df[["ts", "open", "high", "low", "close"]].sort_values("ts").reset_index(drop=True)
 
-
-    out["open"]  = o
-
-    out["high"]  = h
-
-    out["low"]   = l
-
-    out["close"] = c
-
-
-
-    out = out.dropna(subset=["ts","open","high","low","close"]).sort_values("ts").reset_index(drop=True)
-
-    return out[["ts","open","high","low","close"]]
-
-
+    return out
 
 
 
@@ -385,6 +367,14 @@ def add_age_features(feat: pd.DataFrame, cfg: dict, train_months: list, fold_dir
     # If squeeze_pressure requested, finalize after age columns are present
     if "nl_squeeze_score" in out.columns and "agebin_dcw_p" in out.columns and "nl_squeeze_pressure" not in out.columns:
         out["nl_squeeze_pressure"] = out["nl_squeeze_score"] * out["agebin_dcw_p"].astype("float32")
+
+    # Age-bin clamp and causal squeeze-pressure handling
+    if "agebin" in out.columns:
+        out["agebin"] = out["agebin"].fillna(0).astype("int64")
+        out.loc[out["agebin"] < 1, "agebin"] = 1
+    if "nl_squeeze_pressure" in out.columns and "agebin" in out.columns:
+        # keep causality, no leakage from NaNs
+        out["nl_squeeze_pressure"] = out["nl_squeeze_pressure"].fillna(0)
 
     if save_schema and schema["feature_bins"]:
         schema_path.parent.mkdir(parents=True, exist_ok=True)

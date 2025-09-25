@@ -39,7 +39,7 @@ features:
       - trend_agree_15_60
       - trend_agree_60_240
       - trend_ratio_15_60
-      # B) Compression -> release
+      # B) Compression â†’ release
       - squeeze_score
       - squeeze_age
       - release_slope_15
@@ -67,26 +67,18 @@ candidates:
   blind:
     thinning:
       type: cusum_by_ret
-      params:
-        ret_lookback: 480     # was 240; longer memory -> fewer, more meaningful flips
-        k_sigma: 1.8          # moderate sensitivity (don't over-thin to 5)
-        drift: 0.0
-        min_gap_bars: 360     # 6h quick window x 60 bars/h (for 1m bars)
-        fallback_stride_k: 0
+      params: { ret_lookback: 480, k_sigma: 5.0, drift: 0.0, min_gap_bars: 5, fallback_stride_k: 0 }
     sides: both
-  vol_prefilter:
-    column: atr_p             # causal, train-fit percentile (keep percentiles_fit_on: train)
-    min_percentile: 55        # only label in higher-volatility regimes
 
 labels:
   r_mult: 5
-  horizon_hours: 480          # was 240 â€” give trades time to resolve
+  horizon_hours: 480
   quick_ignition_hours: 6
   non_overlap: true
-  non_overlap_policy: quick
-  intra_bar_epsilon_ms: 1
-  min_risk_atr_frac: 0.001
-  eta_atr: 15.0
+  non_overlap_policy: to_exit        # quick | to_exit (must mirror live)
+  intra_bar_epsilon_ms: 1          # forbid intra-bar peeking
+  min_risk_atr_frac: 0.001         # risk floor on fallback
+  eta_atr: 20.0
   eta_by_atr_p:
     - [0, 35, 1.50]
     - [35, 65, 5.00]
@@ -95,7 +87,7 @@ labels:
     - [95, 101, 20.00]
   eta_cap: { min: 0.50, max: 6.00 }
   time_scale_from_eta: { base_eta: 0.30, clamp: [0.75, 10.0] }
-  stop_band_atr: 0.05         # converts drift to resolved exits (small, realistic)
+  stop_band_atr: 0.00
   consec_ticks: 1
   dwell_ms: 0
 
@@ -117,4 +109,69 @@ mining:
     fdr:
       enabled: true
       alpha: 0.10
+
+loser_mask:
+  enabled: true
+  min_support: 20
+  min_months_with_lift: 2
+  min_ppv_lcb: 0.55
+  save_artifact: true
+
+# Gate parameters consumed by walkforward (and echoed inside ml_gating)
+gate:
+  mode: ml
+  calibration: isotonic
+  target_ppv_lcb: 0.60
+  min_coverage: 0.02
+  val_months: 1
+  crosses_cap: 30
+
+# ML gating / feature controls
+ml_gating:
+  enabled: true
+  model: logreg               # logreg | gbdt
+  calibration: isotonic
+  target_ppv_lcb: 0.60
+  min_coverage: 0.02
+  val_months: 1
+  crosses_cap: 30
+  regime_gate: true
+  regime_min_age_bin: 4
+  regime_occ_windows: [240]
+  features:
+    include_prefixes: ["qbin_", "qbin_agebin_", "agebin_", "since_", "occ_", "B_"]
+    exclude_prefixes: []
+  n_bins_cont: auto
+  binning:
+    candidates: [3, 4, 5, 7, 10]
+    min_bin_frac: 0.005
+    mi_delta_min: 0.002
+    ece_delta_min: 0.002
+    max_js_month_drift: 0.15
+    prefer_monotone: true
+
+# Live-like simulation (no BE/TSL, apply fees & funding)
+execution_sim:
+  scheduler:
+    weight_mode: "expR"
+    r_mult: 5.0
+    timeout_sec: 300
+  fees:
+    maker_bps: 1.0            # edit to venue
+    taker_bps: 5.0            # edit to venue
+    entry_is_maker: false      # typical: taker in, maker out
+    exit_is_maker: true
+    # roundtrip_bps: 8.0       # optional single override
+  funding:
+    enabled: true             # false for spot
+    rate_per_hour: 0.0001     # e.g., 1 bp/hour
+    sign: 1.0                 # +1 cost to longs; -1 if longs are paid
+
+tests:
+  parity:
+    enabled: false
+    signals_ref_csv: null
+    trades_ref_csv: null
+    r_tol: 0.02
+    max_signal_mismatch: 0
 

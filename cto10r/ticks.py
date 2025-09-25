@@ -1,10 +1,20 @@
-\
-import pandas as pd
-import numpy as np
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
 from tqdm.auto import tqdm
+from typing import Optional
 
 from .util import coerce_epoch_ms
+
+
+def _safe_float(x, default=np.nan):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
 
 def iter_ticks_files(ticks_dir: Path, symbol: str, yms: list, patt: str):
     """Yield (ym, path) for existing tick files, auto-detecting CSV/Parquet.
@@ -78,6 +88,7 @@ def stream_ticks_window(path: Path, tmin_ms: int, tmax_ms: int, chunk_rows: int 
             yield sel
 
 
+
 def label_events_from_ticks(
     cands: pd.DataFrame,
     ticks_iterables,
@@ -92,8 +103,12 @@ def label_events_from_ticks(
     time_scale_clamp: tuple[float, float] | None = None,
     r_mult: float = 10.0,
     show_progress: bool = True,
+    policy: str = "quick",
+    intra_eps_ms: int = 1,
+    min_risk_frac: float = 0.001,
+    no_ticks_policy: str = "timeout",
 ):
-    # Determine win/loss/timeout using banded first-touch logic on streamed ticks
+    """Label candidate events using streamed ticks with robust bookkeeping."""
     cands = cands.sort_values("ts").reset_index(drop=True).copy()
 
     H_ms_base = int(horizon_hours * 3600 * 1000)
@@ -104,6 +119,26 @@ def label_events_from_ticks(
         if show_progress and n > 1000:
             return tqdm(it, total=n, dynamic_ncols=True, leave=False, desc="label ticks")
         return it
+
+    def _resolve_params(row):
+        side = str(row.get("side", ""))
+        entry = _safe_float(row.get("entry"), default=np.nan)
+        level = _safe_float(row.get("level"), default=np.nan)
+        if not np.isfinite(entry):
+            entry = 0.0
+        if not np.isfinite(level):
+            level = entry
+        atr_val = _safe_float(row.get("atr"), default=np.nan)
+        risk = _safe_float(row.get("risk_dist"), default=np.nan)
+        if not np.isfinite(risk) or risk <= 0:
+            eta_val = _safe_float(row.get("eta"), default=np.nan)
+            if np.isfinite(eta_val) and eta_val > 0 and np.isfinite(atr_val) and atr_val > 0:
+                risk = eta_val * atr_val
+            elif level != entry:
+                risk = abs(entry - level)
+            else:
+                risk = 1e-6
+        return side, float(entry), float(level), float(risk), float(atr_val) if np.isfinite(atr_val) else np.nan
 
     if base_eta_for_time_scale is not None and "eta" in cands.columns:
         base_eta_val = float(base_eta_for_time_scale) if float(base_eta_for_time_scale) != 0.0 else 1.0
@@ -117,77 +152,105 @@ def label_events_from_ticks(
         H_ms = np.full(n, H_ms_base, dtype="int64")
         Q_ms = np.full(n, Q_ms_base, dtype="int64")
 
-    results = []
-    all_ticks = []
+    results: list[dict[str, object]] = []
+    no_ticks_windows = 0
+    fallback_risk_count = 0
+
+    all_ticks: list[pd.DataFrame] = []
     for df in ticks_iterables:
         if len(df):
             all_ticks.append(df[["ts", "price"]].sort_values("ts"))
+
     if not all_ticks:
         for i, row in _with_progress(cands.iterrows()):
+            side, entry, level, risk, _ = _resolve_params(row)
             H_i = int(H_ms[i]) if i < len(H_ms) else H_ms_base
-            results.append(
-                {
-                    "ts": int(row["ts"]),
-                    "side": row["side"],
-                    "entry": float(row["entry"]),
-                    "level": float(row["level"]),
-                    "risk_dist": float(row["risk_dist"]),
-                    "outcome": "timeout",
-                    "outcome_ts": int(row["ts"] + H_i),
-                    "r1_ts": None,
-                    "tp_ts": None,
-                }
-            )
-        return pd.DataFrame(results)
+            results.append({
+                "ts": int(row["ts"]),
+                "side": side,
+                "entry": entry,
+                "level": level,
+                "risk_dist": risk,
+                "outcome": "timeout",
+                "outcome_ts": int(int(row["ts"]) + H_i),
+                "r1_ts": None,
+                "tp_ts": None,
+                "preempted": False,
+            })
+        no_ticks_windows = len(results)
+        df = pd.DataFrame(results)
+        df.attrs["no_ticks_windows"] = no_ticks_windows
+        if "preempted" not in df.columns:
+            df["preempted"] = False
+        df["preempted"] = df["preempted"].fillna(False).astype(bool)
+        print(f"[ticks] diagnostics: no_ticks_windows={no_ticks_windows}")
+        return df
 
     ticks = pd.concat(all_ticks, axis=0).sort_values("ts").reset_index(drop=True)
-    # Build fast arrays once
     tss_all = pd.to_numeric(ticks["ts"], errors="coerce").astype("int64").to_numpy()
     px_all = pd.to_numeric(ticks["price"], errors="coerce").astype(float).to_numpy()
+
     busy_until = -1
     for i, row in _with_progress(cands.iterrows()):
         ts_entry = int(row["ts"])
-        if non_overlap and busy_until != -1 and ts_entry < busy_until:
-            results.append({
-                "ts": ts_entry,
-                "side": row["side"],
-                "entry": float(row["entry"]),
-                "level": float(row["level"]),
-                "risk_dist": float(row["risk_dist"]),
-                "outcome": "timeout",
-                "outcome_ts": ts_entry,
-                "r1_ts": None,
-                "tp_ts": None,
-            })
-            continue
-        t0 = ts_entry
-        side = row["side"]
-        E = float(row["entry"])
-        P = float(row["level"])
-        R = float(row["risk_dist"])
-        tp = E + r_mult * R if side == "long" else E - r_mult * R
-        r1 = E + 1.0 * R if side == "long" else E - 1.0 * R
+        side, entry, level, risk, atr_val = _resolve_params(row)
+        # Risk fallback with ATR-based floor (count diagnostics)
+        R = _safe_float(row.get("risk_dist"), default=np.nan)
+        if not np.isfinite(R) or R <= 0:
+            atr = _safe_float(row.get("atr"), default=np.nan)
+            eta = _safe_float(row.get("eta"), default=np.nan)
+            if np.isfinite(atr) and atr > 0 and np.isfinite(eta) and eta > 0:
+                R = eta * atr
+            elif np.isfinite(atr) and atr > 0:
+                R = atr
+            else:
+                R = _safe_float(abs(_safe_float(row.get("entry")) - _safe_float(row.get("level"))), default=np.nan)
+            fallback_risk_count += 1
+        # enforce ATR-based floor if ATR present
+        atr_for_floor = _safe_float(row.get("atr"), default=np.nan)
+        if np.isfinite(atr_for_floor) and atr_for_floor > 0:
+            R = max(R, float(min_risk_frac) * atr_for_floor)
+        if not np.isfinite(R) or R <= 0:
+            R = 1e-6
+        risk = float(R)
+        atr_use = atr_val if np.isfinite(atr_val) else 0.0
+
+        # Overlaps allowed: do not administratively preempt due to busy windows.
+
+        tp = entry + r_mult * risk if side == "long" else entry - r_mult * risk
+        r1 = entry + 1.0 * risk if side == "long" else entry - 1.0 * risk
+
         H_i = int(H_ms[i]) if i < len(H_ms) else H_ms_base
         Q_i = int(Q_ms[i]) if i < len(Q_ms) else Q_ms_base
-        t_end = t0 + H_i
-        t_r1_deadline = t0 + Q_i
+        t_end = ts_entry + H_i
+        t_r1_deadline = ts_entry + Q_i
 
-        # Fast window slice via searchsorted
-        lo = np.searchsorted(tss_all, t0, side="right")
+        # Shift window start by +ε to forbid intra-bar peeking at entry tick
+        slice_start = int(ts_entry) + int(intra_eps_ms)
+        # find lo index strictly after entry
+        lo = np.searchsorted(tss_all, slice_start, side="left")
         hi = np.searchsorted(tss_all, t_end, side="right")
         if hi <= lo:
-            results.append({
+            no_ticks_windows += 1
+            base_row = {
                 "ts": ts_entry,
-                "side": row["side"],
-                "entry": float(row["entry"]),
-                "level": float(row["level"]),
-                "risk_dist": float(row["risk_dist"]),
-                "outcome": "timeout",
-                "outcome_ts": t_end,
+                "side": side,
+                "entry": entry,
+                "level": level,
+                "risk_dist": risk,
                 "r1_ts": None,
                 "tp_ts": None,
+            }
+            # admin preempt only for no-ticks windows when policy=='skip'
+            is_admin = (str(no_ticks_policy).lower() == "skip")
+            results.append({
+                **base_row,
+                "outcome": "timeout",
+                "preempted": bool(is_admin),
+                "outcome_ts": int(t_end),
             })
             continue
+
         tss = tss_all[lo:hi]
         price = px_all[lo:hi]
 
@@ -196,12 +259,12 @@ def label_events_from_ticks(
         r1_ts = None
         tp_ts = None
 
-        band = stop_band_atr * float(row["atr"])
+        band = stop_band_atr * atr_use
         violated = False
         viol_ix = None
 
         if side == "long":
-            P_eff = P - band
+            P_eff = level - band
             below = price < P_eff
             idx = np.flatnonzero(below)
             if idx.size:
@@ -210,11 +273,10 @@ def label_events_from_ticks(
                 ends = np.r_[cuts, len(idx) - 1]
                 for s, e in zip(starts, ends):
                     length = e - s + 1
-                    if length >= consec_ticks:
-                        if (tss[idx[e]] - tss[idx[s]]) >= dwell_ms:
-                            violated = True
-                            viol_ix = idx[s]
-                            break
+                    if length >= consec_ticks and (tss[idx[e]] - tss[idx[s]]) >= dwell_ms:
+                        violated = True
+                        viol_ix = idx[s]
+                        break
 
             ge_r1 = np.where(price >= r1)[0]
             ge_tp = np.where(price >= tp)[0]
@@ -244,7 +306,7 @@ def label_events_from_ticks(
                     outcome = "timeout"
                     out_ts = t_end
         else:
-            P_eff = P + band
+            P_eff = level + band
             above = price > P_eff
             idx = np.flatnonzero(above)
             if idx.size:
@@ -253,11 +315,10 @@ def label_events_from_ticks(
                 ends = np.r_[cuts, len(idx) - 1]
                 for s, e in zip(starts, ends):
                     length = e - s + 1
-                    if length >= consec_ticks:
-                        if (tss[idx[e]] - tss[idx[s]]) >= dwell_ms:
-                            violated = True
-                            viol_ix = idx[s]
-                            break
+                    if length >= consec_ticks and (tss[idx[e]] - tss[idx[s]]) >= dwell_ms:
+                        violated = True
+                        viol_ix = idx[s]
+                        break
 
             le_r1 = np.where(price <= r1)[0]
             le_tp = np.where(price <= tp)[0]
@@ -287,20 +348,35 @@ def label_events_from_ticks(
                     outcome = "timeout"
                     out_ts = t_end
 
-        results.append(
-            {
-                "ts": int(row["ts"]),
-                "side": side,
-                "entry": E,
-                "level": P,
-                "risk_dist": R,
-                "outcome": outcome,
-                "outcome_ts": int(out_ts),
-                "r1_ts": r1_ts,
-                "tp_ts": tp_ts,
-            }
-        )
-        if non_overlap and outcome == "win" and tp_ts is not None:
-            busy_until = int(tp_ts)
-    return pd.DataFrame(results)
+        results.append({
+            "ts": ts_entry,
+            "side": side,
+            "entry": entry,
+            "level": level,
+            "risk_dist": risk,
+            "outcome": outcome,
+            "outcome_ts": int(out_ts),
+            "r1_ts": r1_ts,
+            "tp_ts": tp_ts,
+            "preempted": False,
+        })
 
+        if non_overlap:
+            pol = str(policy).lower()
+            if pol == "quick":
+                busy_until = max(busy_until, int(t_r1_deadline))
+                if outcome == "win" and tp_ts is not None and np.isfinite(tp_ts):
+                    busy_until = max(busy_until, int(tp_ts))
+            elif pol == "to_exit":
+                busy_until = max(busy_until, int(out_ts))
+            elif pol == "none":
+                pass
+
+    df = pd.DataFrame(results)
+    df.attrs["no_ticks_windows"] = no_ticks_windows
+    df.attrs["fallback_risk_count"] = int(fallback_risk_count)
+    if "preempted" not in df.columns:
+        df["preempted"] = False
+    df["preempted"] = df["preempted"].fillna(False).astype(bool)
+    print(f"[ticks] diagnostics: no_ticks_windows={no_ticks_windows} fallback_risk={fallback_risk_count}")
+    return df

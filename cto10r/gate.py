@@ -194,6 +194,23 @@ def train_gate(
     calibrated = calibrate_probabilities(clf, X_tr, y_tr, method=gate_cfg.calibration)
 
     probs_val = calibrated.predict_proba(X_val)[:, 1]
+    # Brier score and reliability bins (deciles)
+    try:
+        from sklearn.metrics import brier_score_loss as _brier_score_loss
+        brier = float(_brier_score_loss(y_val, probs_val)) if len(y_val) else float("nan")
+    except Exception:
+        brier = float("nan")
+    import numpy as _np
+    bins = _np.linspace(0, 1, 11)
+    digitized = _np.digitize(probs_val, bins) - 1
+    reliab = []
+    for i in range(10):
+        sel = (digitized == i)
+        if not _np.any(sel):
+            reliab.append({"bin": i, "p_mid": float((bins[i] + bins[i + 1]) / 2), "emp": None, "n": 0})
+        else:
+            emp = float(_np.asarray(y_val)[sel].mean())
+            reliab.append({"bin": i, "p_mid": float((bins[i] + bins[i + 1]) / 2), "emp": emp, "n": int(sel.sum())})
     tau, diag = choose_tau_by_targets(
         probs_val,
         y_val,
@@ -212,6 +229,8 @@ def train_gate(
         "ppv_lcb": float(diag.get("ppv_lcb", 0.0)),
         "cov": float(diag.get("cov", 0.0)),
         "loser_rules": int(len(losers)),
+        "brier": brier,
+        "reliability": reliab,
     }
 
     summary_path = artifacts_dir / "gate_summary.json"

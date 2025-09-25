@@ -1,0 +1,38 @@
+﻿  val_months: 1
+  crosses_cap: 30
+  regime_gate: true
+  regime_min_age_bin: 4
+  regime_occ_windows: [240]
+  features:
+    include_prefixes: ["qbin_", "qbin_agebin_", "agebin_", "since_", "occ_", "B_"]
+    exclude_prefixes: []
+  n_bins_cont: auto
+  binning:
+    candidates: [3, 4, 5, 7, 10]
+    min_bin_frac: 0.005
+    mi_delta_min: 0.002
+    ece_delta_min: 0.002
+    max_js_month_drift: 0.15
+    prefer_monotone: true
+
+# Live-like simulation (apply fees & funding)
+execution_sim:
+  fees:
+    maker_bps: 1.0
+    taker_bps: 5.0
+    entry_is_maker: false
+    exit_is_maker: true
+  funding:
+    enabled: true
+    rate_per_hour: 0.0001
+    sign: 1.0
+  inventory:
+    enable: false                 # âœ… disable caps; overlaps are disallowed anyway
+
+tests:
+  parity:
+    enabled: false
+    signals_ref_csv: null
+    trades_ref_csv: null
+    r_tol: 0.02
+    max_signal_mismatch: 0
