@@ -1,0 +1,7 @@
+﻿        how="left",
+    )
+    ev["p_win"] = pd.to_numeric(ev["p_win"], errors="coerce")
+    ev["loser_mask"] = ev["loser_mask"].fillna(False)
+    ev["tau_used"] = ev["tau_used"].fillna(gate_tau)
+
+    if "preempted" not in ev.columns:

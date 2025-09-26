@@ -1,0 +1,25 @@
+﻿    if "p_win" not in cands_t_norm.columns:
+        cands_t_norm = cands_t_norm.copy()
+        cands_t_norm["p_win"] = np.nan
+        cands_t_norm["loser_mask"] = False
+        cands_t_norm["enter"] = False
+        cands_t_norm["tau_used"] = gate_tau
+
+    ev = ev.merge(
+        cands_t_norm[["ts", "p_win", "loser_mask", "enter", "tau_used"]],
+        on="ts",
+        how="left",
+    )
+    ev["p_win"] = pd.to_numeric(ev["p_win"], errors="coerce")
+    ev["loser_mask"] = ev["loser_mask"].fillna(False)
+    ev["tau_used"] = ev["tau_used"].fillna(gate_tau)
+
+    if "preempted" not in ev.columns:
+        ev["preempted"] = False
+    ev["preempted"] = ev["preempted"].fillna(False).astype(bool)
+
+    ev["enter"] = ev["enter"].fillna(False) & (~ev["preempted"])
+
+    ev = ev.sort_values("ts").reset_index(drop=True)
+
+    decision_df = cands_t_norm.copy()

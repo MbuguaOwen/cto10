@@ -1,0 +1,21 @@
+﻿                "losses": 0,
+                "timeouts": 0,
+                "preempted": 0,
+                "no_ticks_windows": 0,
+                "tick_files": tick_file_info,
+            },
+        )
+
+
+        return
+
+
+    # ---- BEGIN: unit-safe per-side best-in-window quick dedupe (2h) ----
+    import numpy as np
+    import pandas as pd
+
+    def _eta_proxy_from_atr_p(series_atr_p: pd.Series, labels_cfg: dict) -> pd.Series:
+        rules = (labels_cfg.get("eta_by_atr_p") or [])
+        if not len(rules):
+            return pd.Series(np.nan, index=series_atr_p.index)
+        def map_one(p):

@@ -1,0 +1,31 @@
+﻿            if len(dt): stats.append(f"minÎ”={_fmt_delta(int(dt.min()), unit)}")
+        else:
+            for s, gg in kept.groupby(kept["side"], observed=True):
+                dt = pd.to_numeric(gg["ts"], errors="coerce").astype("int64").diff().dropna()
+                if len(dt): stats.append(f"{s}:minÎ”={_fmt_delta(int(dt.min()), unit)}")
+        stats_str = " ".join(stats)
+
+        kept_ratio = len(kept)/max(1,len(cands_df))
+        _log(f"[{sym}] dedupe[quick={qh_hours:.0f}h, scope={scope}, rank=etaâ†’atr, unit={unit}]: "
+             f"kept {len(kept)}/{len(cands_df)} ({kept_ratio:.1%}); {stats_str}")
+        # Soft sanity: warn if count is implausibly high for 2h windows in 1 month
+        if kept_ratio > 0.5 and len(kept) > 2000:
+            _log(f"[{sym}] WARNING: dedupe kept unusually many; check ts units & window logic.")
+        return kept
+
+    # ensure we print the prefilter line ONCE
+    _log(f"[{sym}] prefilter: disabled")
+
+    _before = len(cands)
+    cands = dedupe_best_in_window(cands, cfg, sym)
+    # ---- END: unit-safe per-side best-in-window quick dedupe (2h) ----
+
+
+    _log(f"[{sym}] tick_labeling: candidates={len(cands)}")
+
+    tick_file_info: List[Dict[str, Any]] = []
+    months_all = list(dict.fromkeys(train_months + test_months))
+
+
+    try:
+

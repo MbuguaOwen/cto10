@@ -1,0 +1,141 @@
+﻿    else:
+        tg["_date"] = pd.NaT
+
+    is_win = tg.get("is_win")
+    is_loss = tg.get("is_loss")
+    is_to = tg.get("is_to")
+    if is_win is None or is_loss is None:
+        oc = tg.get("outcome")
+        if oc is not None:
+            oc = oc.fillna("")
+            is_win = (oc == "win").astype(int)
+            is_loss = (oc == "loss").astype(int)
+            if "timeout" in set(oc.unique()):
+                is_to = (oc == "timeout").astype(int)
+            else:
+                is_to = pd.Series([0] * len(tg), index=tg.index, dtype=int)
+        else:
+            zeros = pd.Series([0] * len(tg), index=tg.index, dtype=int)
+            is_win = zeros.copy()
+            is_loss = zeros.copy()
+            is_to = zeros.copy()
+
+    if not isinstance(is_win, pd.Series):
+        is_win = pd.Series(is_win, index=tg.index)
+    if not isinstance(is_loss, pd.Series):
+        is_loss = pd.Series(is_loss, index=tg.index)
+    if not isinstance(is_to, pd.Series):
+        is_to = pd.Series(is_to, index=tg.index)
+
+    tg["is_win"] = pd.to_numeric(is_win, errors="coerce").fillna(0).astype(int)
+    tg["is_loss"] = pd.to_numeric(is_loss, errors="coerce").fillna(0).astype(int)
+    tg["is_to"] = pd.to_numeric(is_to, errors="coerce").fillna(0).astype(int)
+
+    daily = tg.groupby("_date").agg(
+        wins=("is_win", "sum") if "is_win" in tg.columns else ("_date", "size"),
+        losses=("is_loss", "sum") if "is_loss" in tg.columns else ("_date", "size"),
+        timeouts=("is_to", "sum") if "is_to" in tg.columns else ("_date", "size"),
+        scheduled=("_date", "size"),
+    ).reset_index()
+
+    daily["wins_roll"] = daily["wins"].rolling(window_days, min_periods=1).sum()
+    daily["losses_roll"] = daily["losses"].rolling(window_days, min_periods=1).sum()
+    daily["resolved_roll"] = daily["wins_roll"] + daily["losses_roll"]
+    daily["ppv_lcb_roll"] = daily.apply(
+        lambda r: wilson_lcb(int(r["wins_roll"]), int(r["resolved_roll"])) if r["resolved_roll"] > 0 else 0.0,
+        axis=1,
+    )
+    daily["timeout_rate_roll"] = (
+        daily["timeouts"].rolling(window_days, min_periods=1).sum()
+        / daily["scheduled"].rolling(window_days, min_periods=1).sum().clip(lower=1)
+    )
+
+    ppv_breach_days = [str(d) for d, v in zip(daily["_date"], daily["ppv_lcb_roll"]) if v < ppv_lcb_min]
+    to_breach_days = [str(d) for d, v in zip(daily["_date"], daily["timeout_rate_roll"]) if v > timeout_rate_max]
+
+    tripwire = {
+        "ppv_lcb_min": ppv_lcb_min,
+        "timeout_rate_max": timeout_rate_max,
+        "window_days": window_days,
+        "fallback_days_max": fallback_days_max,
+        "ppv_lcb_roll_min": float(daily["ppv_lcb_roll"].min() if len(daily) else 0.0),
+        "timeout_rate_roll_max": float(daily["timeout_rate_roll"].max() if len(daily) else 0.0),
+        "ppv_breach_days": ppv_breach_days,
+        "timeout_breach_days": to_breach_days,
+        "scheduler_fallback_used": bool(scheduler_fallback),
+    }
+
+    with open(fold_dir / "tripwire_status.json", "w", encoding="utf-8") as fh:
+        json.dump(tripwire, fh, indent=2)
+
+    if ppv_breach_days or to_breach_days:
+        _log(f"[{sym}] TRIPWIRE breach: {tripwire}")
+
+    take_sched_export = normalize_events_schema(take_sched)
+    take_sched_export.to_csv(fold_dir / "trades_gated.csv", index=False)
+
+    _log(f"[SIM] coverage={coverage:.3f} selected={gated_count} scheduled={len(take_sched)}")
+
+    outcome_series = take_sched.get("outcome")
+    if outcome_series is None:
+        outcome_series = pd.Series(np.full(len(take_sched), "", dtype=object), index=take_sched.index)
+    g_wins = int((outcome_series == "win").sum())
+    g_losses = int((outcome_series == "loss").sum())
+    g_timeouts = int((outcome_series == "timeout").sum())
+    g_denom = max(g_wins + g_losses, 1)
+    g_wr = g_wins / g_denom if g_denom else 0.0
+    g_expR = g_wr * label_r_mult + (1.0 - g_wr) * (-1.0)
+
+    wins_fp_cols_g = ["ts", "side"] + [c for c in RULE_FINGERPRINT_FEATURES if c in take_sched.columns]
+    take_sched.loc[outcome_series == "win", wins_fp_cols_g].to_csv(
+        fold_dir / "wins_fingerprints_gated.csv",
+        index=False,
+    )
+
+    expR_series = take_sched.get("expR", pd.Series([], dtype=float))
+    expR_series = pd.to_numeric(expR_series, errors="coerce") if isinstance(expR_series, pd.Series) else pd.Series(expR_series)
+    expected_R_per_event = float(expR_series.fillna(0.0).mean()) if len(expR_series) else 0.0
+    outcome_non_empty = outcome_series.dropna()
+    outcome_non_empty = outcome_non_empty[outcome_non_empty != ""]
+    denom_outcomes = max(1, int(len(outcome_non_empty)))
+
+    write_json(
+        fold_dir / "stats_gated.json",
+        {
+            "total_events_gated": int(len(take_sched)),
+            "wins": g_wins,
+            "losses": g_losses,
+            "timeouts": g_timeouts,
+            "win_rate": float(g_wins / denom_outcomes) if denom_outcomes else 0.0,
+            "expected_R_per_event": expected_R_per_event,
+            "r_mult": sched_r_mult,
+            "scheduler_fallback": scheduler_fallback,
+        },
+    )
+
+    _log(
+        f"[{sym}] simulate[GATED]: kept={len(ev_g)} scheduled={len(take_sched)} wr={g_wr:.3f} expR={g_expR:.2f}"
+        + (" [fallback]" if scheduler_fallback else "")
+    )
+
+    # --- Parity tests (hard-fail if references provided) ---
+    parity = (cfg.get("tests", {}) or {}).get("parity", {}) or {}
+    if bool(parity.get("enabled", False)):
+        import json as _json
+        import numpy as _np
+        import pandas as _pd
+        import sys as _sys
+        r_tol = float(parity.get("r_tol", 0.02))
+        max_sig_mm = int(parity.get("max_signal_mismatch", 0))
+        sig_ref = parity.get("signals_ref_csv")
+        trd_ref = parity.get("trades_ref_csv")
+
+        # SAME-SIGNAL: compare enter mask if reference exists
+        sig_fail = 0
+        if sig_ref:
+            ref = _pd.read_csv(sig_ref)
+            cur = ev[["ts", "side", "enter"]].copy()
+            joined = _pd.merge(cur, ref, on=["ts", "side"], how="outer", suffixes=("_cur", "_ref"))
+            joined["enter_cur"] = joined["enter_cur"].fillna(False).astype(bool)
+            joined["enter_ref"] = joined["enter_ref"].fillna(False).astype(bool)
+            mism = (joined["enter_cur"] != joined["enter_ref"]).sum()

@@ -1,0 +1,61 @@
+﻿
+    if len(df) == 0:
+        return emit_empty()
+
+    df = df.copy()
+    df["is_win"] = (df["outcome"] == "win").astype(int)
+    df["is_loss"] = (df["outcome"] == "loss").astype(int)
+    df["is_to"] = (df["outcome"] == "timeout").astype(int)
+
+    include_timeouts = bool(rules_cfg.get("precision_include_timeouts", False))
+    # Baseline metrics (TRAIN only)
+    base_total = int(len(df))
+    base_resolved = int((df["is_win"] + df["is_loss"]).sum())
+    if include_timeouts:
+        base_n = base_total
+    else:
+        base_n = base_resolved
+    base_k = int(df["is_win"].sum())
+    base_p = base_k / base_n if base_n > 0 else 0.0  # baseline_precision
+    base_resolve = (base_resolved / base_total) if base_total > 0 else 0.0
+
+    auto = bool(rules_cfg.get("auto_binning", True))
+    max_terms = max(1, int(rules_cfg.get("max_terms", 2)))
+    metric_name = str(rules_cfg.get("metric", "precision_lcb")).lower()
+    min_frac = float(rules_cfg.get("min_support_frac", 0.0))
+    n_train = len(df)
+    min_support_n = max(int(math.ceil(min_frac * n_train)), 1) if n_train > 0 else 1
+    min_months = max(1, int(rules_cfg.get("min_months", 1)))
+    min_wins = int(rules_cfg.get("min_wins", 0))
+    uplift_abs = float(rules_cfg.get("min_precision_uplift_abs", 0.0))
+    uplift_mul = float(rules_cfg.get("min_lift_lcb", 0.0))
+    # Strictness knobs (data-relative)
+    min_precision_uplift_pp = float(rules_cfg.get("min_precision_uplift_pp", 0.0))
+    min_resolve_uplift_pp = float(rules_cfg.get("min_resolve_uplift_pp", 0.0))
+    max_timeout_rate = rules_cfg.get("max_timeout_rate", None)
+    min_resolve_frac = rules_cfg.get("min_resolve_frac", None)
+    abs_min_plcb = rules_cfg.get("abs_min_plcb", rules_cfg.get("min_precision_lcb", None))
+    # loser mining knobs
+    mine_losers = bool(rules_cfg.get("mine_losers", False))
+    loser_top_k = int(rules_cfg.get("loser_top_k", 0))
+    loser_max_precision_ucb = rules_cfg.get("loser_max_precision_ucb", None)
+    loser_min_resolve_frac = rules_cfg.get("loser_min_resolve_frac", None)
+    loser_min_months = int(rules_cfg.get("loser_min_months", 1))
+    top_k = int(rules_cfg.get("top_k", 25))
+    z_score = float(rules_cfg.get("wilson_z", 1.96))
+
+    print(f"[mining] auto_binning={auto} n_train={n_train} min_support={min_support_n}", flush=True)
+    print(f"[mining] baseline: precision={base_p:.3f} resolve={base_resolve:.3f}", flush=True)
+
+    train_mask = np.ones(len(df), dtype=bool)
+    work = df.copy()
+    bin_edges: dict[str, np.ndarray] = {}
+    feature_cols: list[str] = []
+
+    if auto:
+        work, bcols = prepare_literal_buckets(df, train_mask, rules_cfg, features_cfg)
+        literal_cols = [c for c in sorted(bcols) if pd.to_numeric(work[c], errors="coerce").notna().any()]
+        literal_pairs: list[tuple[str, str]] = []
+    else:
+        feature_cols = [
+            "t_240",

@@ -1,0 +1,31 @@
+﻿    # Friendly guard: require features stage to exist
+    cpath = fold_dir / "candidates.parquet"
+    if not cpath.exists():
+        raise FileNotFoundError(
+            f"{cpath} not found. Run features stage first:\n"
+            f"  python -m cto10r --config {cfg_path} --mode walkforward --only features --force"
+        )
+    cands = pd.read_parquet(cpath)
+    # Fast labeling cap for debugging (optional)
+    import os as _os
+    cap = int(_os.getenv("LABEL_MAX", "0") or "0")
+    if cap > 0:
+        cands = cands.sort_values("ts").head(cap).copy()
+        _log(f"[debug] LABEL_MAX={cap} â†’ cands={len(cands)}")
+
+    # Volatility prefilter intentionally disabled (vol_prefilter: null)
+    _log(f"[{sym}] prefilter: disabled")
+
+
+    if cands.empty:
+
+
+        empty_events = pd.DataFrame(columns=["ts", "side", "entry", "level", "risk_dist", "outcome"])
+        empty_events = normalize_events_schema(empty_events)
+        empty_events.attrs["no_ticks_windows"] = 0
+        empty_events.to_parquet(epath, index=False)
+
+
+        _log(f"[{sym}] events: 0 (no candidates)")
+
+

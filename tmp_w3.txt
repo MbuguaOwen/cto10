@@ -1,0 +1,101 @@
+﻿
+
+        empty_events = pd.DataFrame(columns=["ts", "side", "entry", "level", "risk_dist", "outcome"])
+        empty_events = normalize_events_schema(empty_events)
+        empty_events.attrs["no_ticks_windows"] = 0
+        empty_events.to_parquet(epath, index=False)
+
+
+        _log(f"[{sym}] events: 0 (no candidates)")
+
+
+        _write_fingerprint(
+            artifacts_dir,
+            "tick_labeling",
+            cfg_path,
+            {
+                "train_months": list(train_months),
+                "test_months": list(test_months),
+                "events": 0,
+                "wins": 0,
+                "losses": 0,
+                "timeouts": 0,
+                "preempted": 0,
+                "no_ticks_windows": 0,
+                "tick_files": tick_file_info,
+            },
+        )
+
+
+        return
+
+
+    # One-per-side per quick ignition window (dedupe at candidate stage to reduce admin preempts)
+    qh_ms = int(float(cfg["labels"].get("quick_ignition_hours", 6)) * 3600_000)
+    cands = cands.sort_values(["side", "ts"]).reset_index(drop=True)
+    _keep = []
+    last_ts = {"long": -10**18, "short": -10**18}
+    for _, row in cands.iterrows():
+        s = str(row["side"]).lower()
+        t = int(row["ts"])
+        if t - last_ts.get(s, -10**18) >= qh_ms:
+            _keep.append(True)
+            last_ts[s] = t
+        else:
+            _keep.append(False)
+    _before = len(cands)
+    cands = cands.loc[_keep].copy()
+    _log(f"[{sym}] dedupe[quick={qh_ms//3600000}h]: kept {len(cands)}/{_before} ({len(cands)/max(1,_before):.1%})")
+
+
+    _log(f"[{sym}] tick_labeling: candidates={len(cands)}")
+
+    tick_file_info: List[Dict[str, Any]] = []
+    months_all = list(dict.fromkeys(train_months + test_months))
+
+
+    try:
+
+
+        bar_seconds = infer_bar_seconds(cands["ts"])
+
+
+    except Exception:
+
+
+        bar_seconds = 60
+
+
+    labels_cfg = cfg["labels"]
+
+
+    H_hours = int(labels_cfg.get("horizon_hours", 72))
+
+
+    Q_hours = int(labels_cfg.get("quick_ignition_hours", 2))
+
+
+    non_overlap = bool(labels_cfg.get("non_overlap", True))
+
+
+    stop_band_atr = float(labels_cfg.get("stop_band_atr", 0.0))
+
+
+    consec = int(labels_cfg.get("consec_ticks", labels_cfg.get("violation_consecutive_ticks", 1)))
+
+
+    dwell_ms = int(labels_cfg.get("dwell_ms", labels_cfg.get("violation_dwell_ms", 0)))
+
+
+    r_mult = float(labels_cfg.get("r_mult", 10.0))
+    # Policy and epsilon for tick labeling
+    non_overlap_policy = str(labels_cfg.get("non_overlap_policy", "quick"))
+    intra_eps_ms = int(labels_cfg.get("intra_bar_epsilon_ms", 1))
+    min_risk_atr_frac = float(labels_cfg.get("min_risk_atr_frac", 0.001))
+    no_ticks_policy = str(labels_cfg.get("no_ticks_policy", "timeout"))
+
+
+    ts_cfg = labels_cfg.get("time_scale_from_eta")
+
+
+    base_eta = None

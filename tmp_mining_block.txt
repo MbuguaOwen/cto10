@@ -1,0 +1,2 @@
+﻿    max_signal_mismatch: 0
+    r_tol: 0.02

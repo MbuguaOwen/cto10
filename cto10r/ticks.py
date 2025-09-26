@@ -190,11 +190,17 @@ def label_events_from_ticks(
     tss_all = pd.to_numeric(ticks["ts"], errors="coerce").astype("int64").to_numpy()
     px_all = pd.to_numeric(ticks["price"], errors="coerce").astype(float).to_numpy()
 
+    # --- BEGIN: risk + first-touch resolution (robust & side-correct) ---
+    tp_any = 0
+    sl_any = 0
+    tp_first = 0
+    sl_first = 0
+    no_move = 0
     busy_until = -1
     for i, row in _with_progress(cands.iterrows()):
         ts_entry = int(row["ts"])
         side, entry, level, risk, atr_val = _resolve_params(row)
-        # Risk fallback with ATR-based floor (count diagnostics)
+        # Risk fallback with ATR-based floor (count diagnostics) and stop band
         R = _safe_float(row.get("risk_dist"), default=np.nan)
         if not np.isfinite(R) or R <= 0:
             atr = _safe_float(row.get("atr"), default=np.nan)
@@ -210,6 +216,7 @@ def label_events_from_ticks(
         atr_for_floor = _safe_float(row.get("atr"), default=np.nan)
         if np.isfinite(atr_for_floor) and atr_for_floor > 0:
             R = max(R, float(min_risk_frac) * atr_for_floor)
+            R = max(R, float(stop_band_atr) * atr_for_floor)
         if not np.isfinite(R) or R <= 0:
             R = 1e-6
         risk = float(R)
@@ -218,7 +225,7 @@ def label_events_from_ticks(
         # Overlaps allowed: do not administratively preempt due to busy windows.
 
         tp = entry + r_mult * risk if side == "long" else entry - r_mult * risk
-        r1 = entry + 1.0 * risk if side == "long" else entry - 1.0 * risk
+        sl = entry - 1.0 * risk if side == "long" else entry + 1.0 * risk
 
         H_i = int(H_ms[i]) if i < len(H_ms) else H_ms_base
         Q_i = int(Q_ms[i]) if i < len(Q_ms) else Q_ms_base
@@ -254,99 +261,35 @@ def label_events_from_ticks(
         tss = tss_all[lo:hi]
         price = px_all[lo:hi]
 
-        outcome = "timeout"
-        out_ts = t_end
-        r1_ts = None
-        tp_ts = None
-
-        band = stop_band_atr * atr_use
-        violated = False
-        viol_ix = None
-
+        # crossings (first-touch)
         if side == "long":
-            P_eff = level - band
-            below = price < P_eff
-            idx = np.flatnonzero(below)
-            if idx.size:
-                cuts = np.where(np.diff(idx) > 1)[0]
-                starts = np.r_[0, cuts + 1]
-                ends = np.r_[cuts, len(idx) - 1]
-                for s, e in zip(starts, ends):
-                    length = e - s + 1
-                    if length >= consec_ticks and (tss[idx[e]] - tss[idx[s]]) >= dwell_ms:
-                        violated = True
-                        viol_ix = idx[s]
-                        break
-
-            ge_r1 = np.where(price >= r1)[0]
-            ge_tp = np.where(price >= tp)[0]
-
-            if violated and viol_ix is not None and (not ge_tp.size or viol_ix < ge_tp[0]):
-                outcome = "loss"
-                out_ts = int(tss[viol_ix])
-            else:
-                if ge_r1.size and tss[ge_r1[0]] <= t_r1_deadline:
-                    r1_ts = int(tss[ge_r1[0]])
-                    if ge_tp.size:
-                        if (not violated) or (viol_ix is not None and ge_tp[0] < viol_ix):
-                            outcome = "win"
-                            tp_ts = int(tss[ge_tp[0]])
-                            out_ts = tp_ts
-                        else:
-                            outcome = "loss"
-                            out_ts = int(tss[viol_ix])
-                    else:
-                        if violated and viol_ix is not None:
-                            outcome = "loss"
-                            out_ts = int(tss[viol_ix])
-                        else:
-                            outcome = "timeout"
-                            out_ts = t_end
-                else:
-                    outcome = "timeout"
-                    out_ts = t_end
+            idx_tp = np.where(price >= tp)[0]
+            idx_sl = np.where(price <= sl)[0]
         else:
-            P_eff = level + band
-            above = price > P_eff
-            idx = np.flatnonzero(above)
-            if idx.size:
-                cuts = np.where(np.diff(idx) > 1)[0]
-                starts = np.r_[0, cuts + 1]
-                ends = np.r_[cuts, len(idx) - 1]
-                for s, e in zip(starts, ends):
-                    length = e - s + 1
-                    if length >= consec_ticks and (tss[idx[e]] - tss[idx[s]]) >= dwell_ms:
-                        violated = True
-                        viol_ix = idx[s]
-                        break
+            idx_tp = np.where(price <= tp)[0]
+            idx_sl = np.where(price >= sl)[0]
 
-            le_r1 = np.where(price <= r1)[0]
-            le_tp = np.where(price <= tp)[0]
+        has_tp = idx_tp.size > 0
+        has_sl = idx_sl.size > 0
+        tp_any += int(has_tp)
+        sl_any += int(has_sl)
 
-            if violated and viol_ix is not None and (not le_tp.size or viol_ix < le_tp[0]):
-                outcome = "loss"
-                out_ts = int(tss[viol_ix])
+        outcome = "timeout"; out_ts = t_end; r1_ts = None; tp_ts = None
+        if (not has_tp) and (not has_sl):
+            no_move += 1
+        elif has_tp and (not has_sl):
+            tp_first += 1
+            tp_ts = int(tss[int(idx_tp[0])]); out_ts = tp_ts; outcome = "win"
+        elif has_sl and (not has_tp):
+            sl_first += 1
+            out_ts = int(tss[int(idx_sl[0])]); outcome = "loss"
+        else:
+            if int(idx_tp[0]) <= int(idx_sl[0]):
+                tp_first += 1
+                tp_ts = int(tss[int(idx_tp[0])]); out_ts = tp_ts; outcome = "win"
             else:
-                if le_r1.size and tss[le_r1[0]] <= t_r1_deadline:
-                    r1_ts = int(tss[le_r1[0]])
-                    if le_tp.size:
-                        if (not violated) or (viol_ix is not None and le_tp[0] < viol_ix):
-                            outcome = "win"
-                            tp_ts = int(tss[le_tp[0]])
-                            out_ts = tp_ts
-                        else:
-                            outcome = "loss"
-                            out_ts = int(tss[viol_ix])
-                    else:
-                        if violated and viol_ix is not None:
-                            outcome = "loss"
-                            out_ts = int(tss[viol_ix])
-                        else:
-                            outcome = "timeout"
-                            out_ts = t_end
-                else:
-                    outcome = "timeout"
-                    out_ts = t_end
+                sl_first += 1
+                out_ts = int(tss[int(idx_sl[0])]); outcome = "loss"
 
         results.append({
             "ts": ts_entry,
@@ -356,7 +299,7 @@ def label_events_from_ticks(
             "risk_dist": risk,
             "outcome": outcome,
             "outcome_ts": int(out_ts),
-            "r1_ts": r1_ts,
+            "r1_ts": None,
             "tp_ts": tp_ts,
             "preempted": False,
         })
@@ -372,6 +315,8 @@ def label_events_from_ticks(
             elif pol == "none":
                 pass
 
+    print(f"[ticks/sanity] tp_any={tp_any}/{len(cands)} sl_any={sl_any}/{len(cands)} tp_first={tp_first} sl_first={sl_first} no_move={no_move} fallback_risk={fallback_risk_count} no_ticks_windows={no_ticks_windows}")
+    # --- END: risk + first-touch resolution (robust & side-correct) ---
     df = pd.DataFrame(results)
     df.attrs["no_ticks_windows"] = no_ticks_windows
     df.attrs["fallback_risk_count"] = int(fallback_risk_count)

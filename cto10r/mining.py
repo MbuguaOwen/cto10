@@ -10,6 +10,24 @@ from statsmodels.stats.multitest import fdrcorrection
 
 from .util import fit_quantile_edges
 
+def _get_float(d, key, default=0.0):
+    val = d.get(key, default) if d is not None else default
+    if val is None:
+        return float(default)
+    try:
+        return float(val)
+    except Exception:
+        return float(default)
+
+def _get_int(d, key, default=0):
+    val = d.get(key, default) if d is not None else default
+    if val is None:
+        return int(default)
+    try:
+        return int(val)
+    except Exception:
+        return int(default)
+
 
 def wilson_lcb(k: int, n: int, z: float = 1.96) -> float:
     """Wilson score lower confidence bound for a binomial proportion."""
@@ -45,7 +63,17 @@ def match_rules_vectorized(ev_bin: pd.DataFrame, rules: list[dict], lit_prefix: 
 
     # Fast path: boolean literal columns
     lit_cols = [c for c in ev_bin.columns if c.startswith(lit_prefix)]
-    E = ev_bin[lit_cols].astype("int8") if lit_cols else pd.DataFrame(index=ev_bin.index)
+    if lit_cols:
+        # robust: coerce to numeric, drop inf, treat missing as 0 (literal "not firing")
+        E = (
+            ev_bin[lit_cols]
+            .apply(pd.to_numeric, errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0)
+            .astype("int8")
+        )
+    else:
+        E = pd.DataFrame(index=ev_bin.index)
 
     for r in rules:
         if remaining.sum() == 0:
@@ -262,18 +290,30 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
     auto = bool(rules_cfg.get("auto_binning", True))
     max_terms = max(1, int(rules_cfg.get("max_terms", 2)))
     metric_name = str(rules_cfg.get("metric", "precision_lcb")).lower()
-    min_frac = float(rules_cfg.get("min_support_frac", 0.0))
     n_train = len(df)
-    min_support_n = max(int(math.ceil(min_frac * n_train)), 1) if n_train > 0 else 1
-    min_months = max(1, int(rules_cfg.get("min_months", 1)))
-    min_wins = int(rules_cfg.get("min_wins", 0))
-    uplift_abs = float(rules_cfg.get("min_precision_uplift_abs", 0.0))
-    uplift_mul = float(rules_cfg.get("min_lift_lcb", 0.0))
+    # Support: absolute overrides fraction
+    min_support_abs = _get_int(rules_cfg, "min_support", 0)
+    min_support_frac = _get_float(rules_cfg, "min_support_frac", 0.0)
+    if min_support_abs and min_support_abs > 0:
+        min_support_n = int(min_support_abs)
+    else:
+        min_support_n = max(int(math.ceil(min_support_frac * n_train)), 1) if n_train > 0 else 1
+
+    min_months = max(1, _get_int(rules_cfg, "min_months", 1))
+    min_wins = _get_int(rules_cfg, "min_wins", 0)
+
     # Strictness knobs (data-relative)
-    min_precision_uplift_pp = float(rules_cfg.get("min_precision_uplift_pp", 0.0))
-    min_resolve_uplift_pp = float(rules_cfg.get("min_resolve_uplift_pp", 0.0))
+    uplift_abs = _get_float(rules_cfg, "min_precision_uplift_abs", 0.0)
+    uplift_mul = _get_float(rules_cfg, "min_lift_lcb", 0.0)
+    min_precision_uplift_pp = _get_float(rules_cfg, "min_precision_uplift_pp", 0.0)
+    min_resolve_uplift_pp = _get_float(rules_cfg, "min_resolve_uplift_pp", 0.0)
+    # Resolve/timeout hygiene
+    min_resolve_frac = _get_float(rules_cfg, "min_resolve_frac", 0.0)  # 0 disables
     max_timeout_rate = rules_cfg.get("max_timeout_rate", None)
-    min_resolve_frac = rules_cfg.get("min_resolve_frac", None)
+    try:
+        max_timeout_rate = float(max_timeout_rate) if max_timeout_rate is not None else None
+    except Exception:
+        max_timeout_rate = None
     abs_min_plcb = rules_cfg.get("abs_min_plcb", rules_cfg.get("min_precision_lcb", None))
     # loser mining knobs
     mine_losers = bool(rules_cfg.get("mine_losers", False))
@@ -282,7 +322,7 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
     loser_min_resolve_frac = rules_cfg.get("loser_min_resolve_frac", None)
     loser_min_months = int(rules_cfg.get("loser_min_months", 1))
     top_k = int(rules_cfg.get("top_k", 25))
-    z_score = float(rules_cfg.get("wilson_z", 1.96))
+    z_score = _get_float(rules_cfg, "wilson_z", 1.96)
 
     print(f"[mining] auto_binning={auto} n_train={n_train} min_support={min_support_n}", flush=True)
     print(f"[mining] baseline: precision={base_p:.3f} resolve={base_resolve:.3f}", flush=True)
@@ -353,6 +393,15 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
         unique_months = int(sub["ym"].nunique()) if "ym" in sub.columns else 1
         if unique_months < min_months:
             return
+        # Optional resolve/timeout hygiene
+        if min_resolve_frac and min_resolve_frac > 0.0:
+            resolve_frac = (wins + losses) / n if n > 0 else 0.0
+            if resolve_frac < min_resolve_frac:
+                return
+        if (max_timeout_rate is not None) and (0.0 <= max_timeout_rate < 1.0):
+            to_rate = tos / n if n > 0 else 0.0
+            if to_rate > max_timeout_rate:
+                return
         p_hat = wins / n if n else 0.0
         p_lcb = wilson_lcb(wins, n, z=z_score)
         if base_p > 0:
@@ -521,10 +570,43 @@ def mine_rules(cands: pd.DataFrame, events: pd.DataFrame, cfg: dict):
     if not rule_stats:
         return emit_empty()
 
-    # --- FDR control (optional, on by default) ---
-    fdr_cfg = (cfg.get("rules", {}) or {}).get("fdr", {})
-    fdr_enable = bool(fdr_cfg.get("enabled", True))
-    alpha = float(fdr_cfg.get("alpha", 0.10))  # 10% FDR default
+    # --- FDR control (optional) ---
+    fdr_cfg = dict(((cfg.get("rules", {}) or {}).get("fdr", {}) or {}))
+    fdr_enable = bool(fdr_cfg.get("enabled", False))
+    try:
+        alpha = float(fdr_cfg.get("alpha", 0.10))
+    except Exception:
+        alpha = 0.10
+
+    # --- BEFORE the FDR block, after rule_stats has been filled ---
+    stats_prefdr = pd.DataFrame(rule_stats.values()).copy()
+
+    # Build conservative p-values from precision LCB (same proxy used downstream)
+    if len(stats_prefdr):
+        stats_prefdr["pval_proxy"] = 1.0 - stats_prefdr["precision_lcb"].clip(0, 1)
+
+        # Compute BH q-values at the configured alpha (for reference only)
+        try:
+            from statsmodels.stats.multitest import fdrcorrection
+            rej_tmp, qvals_tmp = fdrcorrection(stats_prefdr["pval_proxy"].to_numpy(), alpha=alpha, method="indep")
+            stats_prefdr["qval_bh"] = qvals_tmp
+            stats_prefdr["bh_reject_at_alpha"] = rej_tmp
+        except Exception:
+            stats_prefdr["qval_bh"] = float("nan")
+            stats_prefdr["bh_reject_at_alpha"] = False
+
+        # Baseline PPV for lift context
+        stats_prefdr["baseline_ppv"] = float(base_p)
+
+        # Write a pre-FDR snapshot once per fold
+        stats_prefdr.to_csv(artifacts_dir / "rules_eval_prefdr.csv", index=False)
+
+        # Tiny log summary
+        p = stats_prefdr["pval_proxy"]
+        pre_min = float(p.min()) if len(p) else float("nan")
+        pre_p05 = int((p < 0.05).sum()) if len(p) else 0
+        pre_at_alpha = int(stats_prefdr["bh_reject_at_alpha"].sum()) if "bh_reject_at_alpha" in stats_prefdr else 0
+        print(f"[mining] pre-FDR: min_p={pre_min:.4g} p<0.05={pre_p05} BH@alpha={alpha} keep={pre_at_alpha}", flush=True)
 
     if fdr_enable and rule_stats:
         # Build p-values from LCB vs baseline: conservative proxy

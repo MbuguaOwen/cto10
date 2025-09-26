@@ -1,0 +1,41 @@
+﻿                bvals[mask_vals] = np.digitize(values[mask_vals], bin_edges[feat], right=True)
+            work[f"B_{feat}"] = bvals
+        literal_cols = [f"B_{feat}" for feat in feature_cols if pd.notna(work[f"B_{feat}"]).any()]
+        literal_pairs = [(feat, f"B_{feat}") for feat in feature_cols if f"B_{feat}" in literal_cols]
+
+    if not literal_cols:
+        return emit_empty()
+
+    progress_on = bool(cfg.get("progress", True))
+
+    rule_stats: dict[str, dict] = {}
+    rule_payload: dict[str, dict] = {}
+
+    z_score = float(rules_cfg.get("wilson_z", 1.96))
+
+    def register_rule(rule_id: str, conds: list[dict], sub: pd.DataFrame) -> None:
+        n, wins, losses, tos = rule_precision_counts(sub, include_timeouts)
+        if n < min_support_n:
+            return
+        if wins < min_wins:
+            return
+        unique_months = int(sub["ym"].nunique()) if "ym" in sub.columns else 1
+        if unique_months < min_months:
+            return
+        p_hat = wins / n if n else 0.0
+        p_lcb = wilson_lcb(wins, n, z=z_score)
+        if base_p > 0:
+            lift = p_hat / base_p
+            lift_lcb = p_lcb / base_p
+        else:
+            lift = float("inf") if p_hat > 0 else 0.0
+            lift_lcb = float("inf") if p_lcb > 0 else 0.0
+
+        months_with_lift = 0
+        if "ym" in sub.columns:
+            bym = sub.groupby("ym", observed=False, sort=False).agg(
+                n=("is_win", "size"),
+                win=("is_win", "sum"),
+                loss=("is_loss", "sum"),
+                to=("is_to", "sum"),
+            ).reset_index()

@@ -89,6 +89,24 @@ RULE_FINGERPRINT_FEATURES = [
 ]
 
 
+def _write_empty_trades_csv(path):
+    import pandas as pd
+    cols = [
+        "ts",
+        "side",
+        "entry",
+        "tp",
+        "sl",
+        "exit_ts",
+        "outcome",
+        "r",
+        "preempted",
+        "tau_used",
+        "p_win",
+    ]
+    pd.DataFrame(columns=cols).to_csv(path, index=False)
+
+
 ALL_STAGES = ["features", "tick_labeling", "mining", "simulate"]
 
 
@@ -714,7 +732,7 @@ def stage_tick_labeling(sym: str, train_months: List[str], test_months: List[str
         _log(f"[debug] LABEL_MAX={cap} → cands={len(cands)}")
 
     # Volatility prefilter intentionally disabled (vol_prefilter: null)
-    _log(f"[{sym}] prefilter: disabled")
+    # (prefilter disabled)
 
 
     if cands.empty:
@@ -750,22 +768,125 @@ def stage_tick_labeling(sym: str, train_months: List[str], test_months: List[str
         return
 
 
-    # One-per-side per quick ignition window (dedupe at candidate stage to reduce admin preempts)
-    qh_ms = int(float(cfg["labels"].get("quick_ignition_hours", 6)) * 3600_000)
-    cands = cands.sort_values(["side", "ts"]).reset_index(drop=True)
-    _keep = []
-    last_ts = {"long": -10**18, "short": -10**18}
-    for _, row in cands.iterrows():
-        s = str(row["side"]).lower()
-        t = int(row["ts"])
-        if t - last_ts.get(s, -10**18) >= qh_ms:
-            _keep.append(True)
-            last_ts[s] = t
+    # ---- BEGIN: unit-safe per-side best-in-window quick dedupe (2h) ----
+    import numpy as np
+
+    def _eta_proxy_from_atr_p(series_atr_p: pd.Series, labels_cfg: dict) -> pd.Series:
+        rules = (labels_cfg.get("eta_by_atr_p") or [])
+        if not len(rules):
+            return pd.Series(np.nan, index=series_atr_p.index)
+        def map_one(p):
+            p = float(p) if pd.notna(p) else 50.0
+            for lo, hi, val in rules:
+                if p >= lo and p < hi:
+                    return float(val)
+            return float(rules[-1][2])
+        eta = series_atr_p.map(map_one)
+        cap = labels_cfg.get("eta_cap", {})
+        return eta.clip(lower=float(cap.get("min", eta.min() if len(eta) else 0.0)),
+                        upper=float(cap.get("max", eta.max() if len(eta) else 1e9)))
+
+    def _detect_ts_unit(tser: pd.Series) -> str:
+        """Return 'sec'|'ms'|'ns' by inspecting positive deltas only."""
+        t = pd.to_numeric(tser, errors="coerce").astype("int64")
+        dt = t.sort_values().diff()
+        dt = dt[dt > 0]                         # ignore zeros/dupes (skewed median)
+        q = float(dt.median()) if len(dt) else 60.0
+        # thresholds: ~1s, ~1e3 ms, ~1e9 ns
+        if q >= 1e10:  # ~>10 billion ns ~ 10s → ns-level stamps
+            return "ns"
+        if q >= 1e4:   # ~>10k ms → ms-level stamps
+            return "ms"
+        return "sec"
+
+    def _qh_in_unit(hours: float, unit: str) -> int:
+        if unit == "sec": return int(hours * 3_600)
+        if unit == "ms":  return int(hours * 3_600_000)
+        return int(hours * 3_600_000_000_000)  # ns
+
+    def _fmt_delta(d: int, unit: str) -> str:
+        denom = {"sec": 60, "ms": 60_000, "ns": 60_000_000_000}
+        mins = d / denom[unit]
+        if mins < 120:
+            return f"{mins:.0f}m"
+        return f"{mins/60:.1f}h"
+
+    def dedupe_best_in_window(cands_df: pd.DataFrame, cfg: dict, sym: str) -> pd.DataFrame:
+        if cands_df.empty:
+            _log(f"[{sym}] dedupe: no candidates")
+            return cands_df
+
+        c = cands_df.copy()
+        c["side"] = c["side"].astype(str).str.strip().str.lower()
+        c["ts"]   = pd.to_numeric(c["ts"], errors="coerce").astype("int64")
+
+        labels_cfg = cfg.get("labels", {}) or {}
+        dcfg = cfg.get("dedupe", {}) or {}
+        scope  = str(dcfg.get("scope", "side")).lower()          # 'side' or 'symbol'
+        rankby = str(dcfg.get("rank_by", "eta_proxy_then_atr")).lower()
+        qh_hours = float(labels_cfg.get("quick_ignition_hours", 2.0))
+
+        unit = _detect_ts_unit(c["ts"])
+        qh   = _qh_in_unit(qh_hours, unit)
+
+        # ranking: lowest eta proxy (closest TP), then highest atr_p, then earliest ts
+        eta_proxy = c["eta"].astype(float) if ("eta" in c.columns and rankby.startswith("eta")) \
+                    else _eta_proxy_from_atr_p(c.get("atr_p", pd.Series(index=c.index)), labels_cfg)
+        atrp = c.get("atr_p", pd.Series(-np.inf, index=c.index)).astype(float)
+
+        c["_rank_eta"] = eta_proxy
+        c["_rank_atr"] = atrp
+
+        keep_idx = []
+        groups = [("symbol", c)] if scope == "symbol" else list(c.groupby("side", observed=True))
+        for gname, g in groups:
+            g = g.sort_values(["ts"]).reset_index()
+            i, n = 0, len(g)
+            while i < n:
+                start_ts = int(g.loc[i, "ts"])
+                # window = [start_ts, start_ts + qh)
+                j = i
+                limit = start_ts + qh
+                while j < n and int(g.loc[j, "ts"]) < limit:
+                    j += 1
+                w = g.loc[i:j-1] if j > i else g.loc[i:i]
+                w = w.sort_values(by=["_rank_eta", "_rank_atr", "ts"],
+                                  ascending=[True, False, True])
+                best = w.iloc[0]
+                keep_idx.append(int(best["index"]))
+                # next window starts at best.ts + qh
+                next_limit = int(best["ts"]) + qh
+                while j < n and int(g.loc[j, "ts"]) < next_limit:
+                    j += 1
+                i = j
+
+        kept = cands_df.loc[sorted(set(keep_idx))].sort_values("ts").reset_index(drop=True)
+
+        # spacing sanity per scope
+        stats = []
+        if scope == "symbol":
+            dt = pd.to_numeric(kept["ts"], errors="coerce").astype("int64").diff().dropna()
+            if len(dt): stats.append(f"minΔ={_fmt_delta(int(dt.min()), unit)}")
         else:
-            _keep.append(False)
+            for s, gg in kept.groupby(kept["side"], observed=True):
+                dt = pd.to_numeric(gg["ts"], errors="coerce").astype("int64").diff().dropna()
+                if len(dt): stats.append(f"{s}:minΔ={_fmt_delta(int(dt.min()), unit)}")
+        stats_str = " ".join(stats)
+
+        kept_ratio = len(kept)/max(1,len(cands_df))
+        _log(f"[{sym}] dedupe[quick={qh_hours:.0f}h, scope={scope}, rank=eta→atr, unit={unit}]: "
+             f"kept {len(kept)}/{len(cands_df)} ({kept_ratio:.1%}); {stats_str}")
+        # Soft sanity: warn if count is implausibly high for 2h windows in 1 month
+        if kept_ratio > 0.5 and len(kept) > 2000:
+            _log(f"[{sym}] WARNING: dedupe kept unusually many; check ts units & window logic.")
+        return kept
+
+    # ensure we print the prefilter line ONCE
+    _log(f"[{sym}] prefilter: disabled")
+
     _before = len(cands)
-    cands = cands.loc[_keep].copy()
-    _log(f"[{sym}] dedupe[quick={qh_ms//3600000}h]: kept {len(cands)}/{_before} ({len(cands)/max(1,_before):.1%})")
+    cands = dedupe_best_in_window(cands, cfg, sym)
+    # ---- END: unit-safe per-side best-in-window quick dedupe (2h) ----
 
 
     _log(f"[{sym}] tick_labeling: candidates={len(cands)}")
@@ -1256,6 +1377,7 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
 
 
     prog_cfg = (cfg.get("progress", {}) or {}).get("sim", {}) or {}
+    scheduler_fallback = False
     show_inner = bool(prog_cfg.get("inner_schedule_bar", False))
     desc_inner = str(prog_cfg.get("schedule_desc", "schedule"))
     upd_every = int(prog_cfg.get("schedule_update_every", 1000))
@@ -1403,8 +1525,10 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
         on="ts",
         how="left",
     )
+    # normalize p_win and boolean columns
     ev["p_win"] = pd.to_numeric(ev["p_win"], errors="coerce")
-    ev["loser_mask"] = ev["loser_mask"].fillna(False)
+    ev["loser_mask"] = ev["loser_mask"].fillna(False).astype(bool)
+    ev["enter"] = ev["enter"].fillna(False).astype(bool)
     ev["tau_used"] = ev["tau_used"].fillna(gate_tau)
 
     if "preempted" not in ev.columns:
@@ -1423,39 +1547,35 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
         .astype(bool)
     )
 
-    label_merge_cols = [c for c in join_cols if c in decision_df.columns and c in ev.columns]
-    if label_merge_cols:
-        extra_cols = ["preempted"] if "preempted" in ev.columns else []
-        label_lookup = ev[label_merge_cols + ["outcome"] + extra_cols].copy()
-        label_lookup["label_resolved"] = label_lookup["outcome"].map({
-            "win": 1,
-            "loss": -1,
-            "timeout": 0,
-        })
-        label_lookup = label_lookup.drop_duplicates(subset=label_merge_cols, keep="last")
-        merge_cols = label_merge_cols + ["label_resolved"] + extra_cols
-        decision_df = decision_df.merge(
-            label_lookup[merge_cols],
-            on=label_merge_cols,
-            how="left",
-        )
-        if "label" in decision_df.columns:
-            decision_df["label"] = pd.to_numeric(decision_df["label"], errors="coerce")
-            decision_df["label"] = decision_df["label"].fillna(decision_df.pop("label_resolved"))
-        else:
-            decision_df["label"] = decision_df.pop("label_resolved")
-    else:
-        decision_df["label"] = pd.to_numeric(
-            decision_df.get("label", pd.Series(np.nan, index=decision_df.index)),
-            errors="coerce",
-        )
-        if "preempted" not in decision_df.columns:
-            decision_df["preempted"] = False
+    # Robust label merge: try full key, then fallback to ts-only
+    label_merge_cols = [c for c in ["ts", "side", "entry", "level", "risk_dist"] if c in decision_df.columns and c in ev.columns]
+
+    def _merge_labels(dec_df: pd.DataFrame, ev_df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+        if not cols:
+            out = dec_df.copy()
+            out["label_resolved"] = np.nan
+            return out
+        ll = ev_df[cols + ["outcome"]].copy()
+        ll["label_resolved"] = ll["outcome"].map({"win": 1, "loss": -1, "timeout": 0})
+        ll = ll.drop_duplicates(subset=cols, keep="last")
+        out = dec_df.merge(ll[cols + ["label_resolved"]], on=cols, how="left")
+        return out
+
+    decision_df = _merge_labels(decision_df, ev, label_merge_cols)
+    # Materialize label from resolved mapping
+    decision_df["label"] = pd.to_numeric(decision_df.get("label", pd.Series(np.nan, index=decision_df.index)), errors="coerce")
+    decision_df["label"] = decision_df["label"].fillna(decision_df.pop("label_resolved"))
+    # Fallback: if nothing matched, try ts-only
+    if decision_df["label"].isna().all():
+        decision_df = _merge_labels(decision_df.drop(columns=["label"], errors="ignore"), ev, ["ts"])
+        decision_df["label"] = decision_df.pop("label_resolved")
 
     decision_df["label"] = pd.to_numeric(decision_df["label"], errors="coerce")
     if "preempted" not in decision_df.columns:
         decision_df["preempted"] = False
-    decision_df["preempted"] = decision_df["preempted"].fillna(False).astype(bool)
+    decision_df["preempted"] = (
+        decision_df["preempted"].fillna(False).astype("boolean").astype(bool)
+    )
     decision_df["enter"] = go_series.to_numpy() & (~decision_df["preempted"].to_numpy())
 
     tau_series = pd.to_numeric(decision_df.get("tau_used", pd.Series([], dtype=float)), errors="coerce").dropna()
@@ -1649,7 +1769,10 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
     gated_count = int(ev_g.shape[0])
 
     ev_g_export = normalize_events_schema(ev_g)
-    ev_g_export.to_csv(fold_dir / "trades_gated_presched.csv", index=False)
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    trades_csv = fold_dir / "trades_gated.csv"
+    presched_csv = fold_dir / "trades_gated_presched.csv"
+    ev_g_export.to_csv(presched_csv, index=False)
 
     # Sequential scheduling: one-at-a-time, busy until exit
     selected = ev_g.sort_values(["ts", "side"]).reset_index(drop=True)
@@ -1766,9 +1889,13 @@ def stage_simulate(sym: str, train_months: List[str], test_months: List[str], cf
         _log(f"[{sym}] TRIPWIRE breach: {tripwire}")
 
     take_sched_export = normalize_events_schema(take_sched)
-    take_sched_export.to_csv(fold_dir / "trades_gated.csv", index=False)
+    take_sched_export.to_csv(trades_csv, index=False)
 
     _log(f"[SIM] coverage={coverage:.3f} selected={gated_count} scheduled={len(take_sched)}")
+    if not trades_csv.exists():
+        _write_empty_trades_csv(trades_csv)
+    if not presched_csv.exists():
+        _write_empty_trades_csv(presched_csv)
 
     outcome_series = take_sched.get("outcome")
     if outcome_series is None:
